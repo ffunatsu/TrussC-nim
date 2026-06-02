@@ -1,4 +1,4 @@
-$LibUrl = 'https://github.com/funatsufumiya/TrussC-nim/releases/download/TrussC-v0.5.0.1/vs_x64_libs.zip'
+$LibUrl = 'https://github.com/ffunatsu/TrussC-nim/releases/download/TrussC-v0.5.0.1/vs_x64_libs.zip'
 $LibDest = 'lib\\vs\\x64'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
