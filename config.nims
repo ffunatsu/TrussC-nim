@@ -62,7 +62,7 @@ when defined(windows):
   switch("passC", "/DFAR=")
   switch("passC", "/DNOMINMAX")
 else:
-  #switch("passC", "-std=c++20")
+  switch("passC", "-std=c++20")
   switch("cpp.options.always", "-std=c++20")
 
 switch("path", "src")
