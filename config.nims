@@ -5,6 +5,7 @@ import std/macros
 import std/os
 # import std/private/ospaths2
 from std/sequtils import toSeq
+from os import `/`
 
 const projectRoot = parentDir(system.currentSourcePath)
 
