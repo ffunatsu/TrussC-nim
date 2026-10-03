@@ -78,6 +78,15 @@ $ nim c -r examples/hello.nim
 $ nim c -r examples/cpp_interop.nim
 ```
 
+## How to use this as separated library
+
+1. Clone this repository (TrussC-nim) somewhere
+2. Create your project directory (somewhere else)
+3. Copy config.nims from the TrussC-nim
+4. Modify `projectRoot` of TrussC-nim
+5. (If there's dlls on the root of TrussC-nim, also copy them)
+6. Finally, normally `nim c -r your_code.nim`
+
 ## How to use tcx addons
 
 - At first, create `xxx.nim.addons` at side of the nim file.
