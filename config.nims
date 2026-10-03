@@ -1,5 +1,6 @@
 import std/strutils
 import std/strformat
+import std/strtabs
 import std/os
 # import std/private/ospaths2
 from std/sequtils import toSeq
@@ -24,6 +25,19 @@ proc requireDirs(dirs: seq[string], hintCmd: string) =
     if not dirExists(p):
       let newline = "\n"
       quit(fmt"[Error] {p} not found.{newline}Please run: {hintCmd} to install the libraries and retry.{newline}")
+
+proc where(cmd: string): bool =
+  when defined(windows):
+    var result = gorgeEx(fmt"where.exe {cmd}")
+    return result[1] == 0
+  else:
+    var result = gorgeEx(fmt"which {cmd}")
+    return result[1] == 0
+
+when defined(windows):
+  # check clang-cl exists
+  if not where("clang-cl"):
+    quit("[Error] clang-cl not found. Please install LLVM/Clang via Visual Studio Installer and ensure clang-cl is in your PATH (and ensure you're using Native Tools Command Prompt for VS).")
 
 when defined(windows):
   requireDirs(@["lib\\vs"], ".\\scripts\\init_win.ps1")
