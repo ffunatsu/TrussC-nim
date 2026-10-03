@@ -67,9 +67,9 @@ else:
   switch("passC", "-std=c++20")
   switch("cpp.options.always", "-std=c++20")
 
-switch("path", "src")
-switch("passC", "-Iinclude")
-switch("passC", "-Ihap")
+switch("path", joinPath(projectRoot, "src"))
+switch("passC", "-I" & joinPath(projectRoot, "include"))
+switch("passC", "-I" & joinPath(projectRoot, "hap"))
 
 # https://stackoverflow.com/a/67173508/2696422
 macro includeNims(
@@ -94,9 +94,9 @@ if preferredAddons.len > 0:
     quit(fmt"[Error] addons file found: {preferredAddons}{nl}but addons directory not present: {localAddonsDir}{nl}Create the directory or remove the addons file and retry.{nl}")
 
 when defined(windows):
-  switch("passL", "lib\\vs\\x64\\TrussC.lib")
+  switch("passL", joinPath(projectRoot, "lib\\vs\\x64\\TrussC.lib"))
 elif defined(macosx):
-  switch("passL", "lib/osx/libTrussC.a")
+  switch("passL", joinPath(projectRoot, "lib/osx/libTrussC.a"))
   switch("passL","-framework Metal")
   switch("passL","-framework MetalKit")
   switch("passL","-framework Cocoa")
