@@ -6,7 +6,7 @@
 
 #include "tcEvent.h"
 #include "tcEventArgs.h"
-#include "sokol/sokol_app.h"
+#include "sokol/sokol_app_tc.h"
 
 namespace trussc {
 
@@ -20,7 +20,16 @@ public:
     Event<void> update;           // Before update each frame
     Event<void> draw;             // Before draw each frame
     Event<void> onRender;          // After sokol_gl flush, render pass still active
+    Event<void> afterFrame;        // After present() (swapchain committed, outside any pass)
     Event<void> exit;             // On app exit
+    // Hot reload only: the host is about to unload the current guest
+    // generation (its App is still alive). Fired on each reload, and when the
+    // host unloads the last generation at exit (after `exit`). Code in the
+    // guest with state that outlives the App (function-local statics,
+    // singletons) drops its listeners on the host's events here: a guest
+    // image stays loaded, so nothing else removes them. Never fired in a
+    // normal (non hot reload) build.
+    Event<void> hotReloadUnload;
 
     // Exit request (can be cancelled)
     Event<ExitRequestEventArgs> exitRequested;  // Set args.cancel = true to cancel
@@ -29,7 +38,7 @@ public:
     Event<KeyEventArgs> keyPressed;
     Event<KeyEventArgs> keyReleased;
 
-    // Mouse
+    // Mouse (one struct per kind so no field is ever meaningless)
     Event<MouseEventArgs> mousePressed;
     Event<MouseEventArgs> mouseReleased;
     Event<MouseMoveEventArgs> mouseMoved;
@@ -41,6 +50,9 @@ public:
 
     // Drag & drop
     Event<DragDropEventArgs> filesDropped;
+
+    // Clipboard paste (Cmd+V / Ctrl+V / browser paste); args.text holds the content
+    Event<ClipboardPastedEventArgs> clipboardPasted;
 
     // Console input (commands from stdin)
     Event<ConsoleEventArgs> console;
@@ -55,11 +67,8 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Global accessor
+// Global accessor (non-inline: Host/Guest share the same instance on Windows)
 // ---------------------------------------------------------------------------
-inline CoreEvents& events() {
-    static CoreEvents instance;
-    return instance;
-}
+CoreEvents& events();
 
 } // namespace trussc

@@ -34,15 +34,51 @@
 #include <cstring>
 #include <string>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 #include "tc/gpu/shaders/iblBake.glsl.h"
 
 namespace trussc {
+
+class Environment;
+
+namespace internal {
+
+void clearEnvironmentFromAllContexts(Environment* environment);
+
+// Shared baking resources (pipelines, quad buffer), lazily created on the
+// first bake (Environment::ensureBakeResources).
+struct IblBakeResources {
+    sg_shader eqShader{};
+    sg_shader irrShader{};
+    sg_shader preShader{};
+    sg_shader lutShader{};
+    sg_pipeline eqPipe{};      // target: RGBA16F
+    sg_pipeline irrPipe{};     // target: RGBA16F
+    sg_pipeline prePipe{};     // target: RGBA16F
+    sg_pipeline lutPipe{};     // target: RG16F
+    sg_buffer quadVbuf{};      // 6 verts, 2 triangles
+    sg_sampler linearSampler{};
+    bool ready = false;        // all four shaders usable (internalShaderReady)
+    bool initialized = false;
+};
+
+// One set per process, defined in tcGlobal.cpp. Nothing destroys these
+// shaders and pipelines. Header-inline, each hot reload guest generation that
+// baked made 4 more shaders in the host's pool (32 by default), which ran out
+// after a few reloads (#249).
+IblBakeResources& iblBakeResources();
+
+} // namespace internal
 
 class Environment {
 public:
     Environment() = default;
 
     ~Environment() {
+        internal::clearEnvironmentFromAllContexts(this);
         release();
     }
 
@@ -51,7 +87,7 @@ public:
 
     // Load an equirectangular HDR image from disk and bake all IBL maps.
     // Returns false if the file cannot be loaded.
-    bool loadFromHDR(const std::string& path) {
+    bool loadFromHDR(const fs::path& path) {
         Pixels src;
         if (!src.loadHDR(path)) {
             logError("Environment") << "loadHDR failed: " << path;
@@ -172,37 +208,44 @@ private:
     Texture brdfLut_;
     bool loaded_ = false;
 
-    // -------------------------------------------------------------------------
-    // Shared baking resources (pipelines, quad buffer). Lazy-initialized on
-    // the first bake call.
-    // -------------------------------------------------------------------------
-    struct BakeResources {
-        sg_shader eqShader{};
-        sg_shader irrShader{};
-        sg_shader preShader{};
-        sg_shader lutShader{};
-        sg_pipeline eqPipe{};      // target: RGBA16F
-        sg_pipeline irrPipe{};     // target: RGBA16F
-        sg_pipeline prePipe{};     // target: RGBA16F
-        sg_pipeline lutPipe{};     // target: RG16F
-        sg_buffer quadVbuf{};      // 6 verts, 2 triangles
-        sg_sampler linearSampler{};
-        bool initialized = false;
-    };
-
-    static BakeResources& bake() {
-        static BakeResources r;
-        return r;
+    // True on iOS/iPadOS Safari (the WebKit GPU backend that breaks on cube-face
+    // render targets). iPad reports as Mac, so also check touch points. Cached.
+    static bool isIosWeb() {
+#ifdef __EMSCRIPTEN__
+        static int cached = -1;  // cached probe: a per-module copy is harmless
+        if (cached < 0) {
+            cached = emscripten_run_script_int(
+                "((/iPhone|iPad|iPod/.test(navigator.userAgent)||"
+                "(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1))?1:0)");
+        }
+        return cached == 1;
+#else
+        return false;
+#endif
     }
 
+    // -------------------------------------------------------------------------
+    // Shared baking resources (pipelines, quad buffer): internal::IblBakeResources,
+    // one per process. Lazy-initialized on the first bake call.
+    // -------------------------------------------------------------------------
+    using BakeResources = internal::IblBakeResources;
+
     static void ensureBakeResources() {
-        BakeResources& r = bake();
+        BakeResources& r = internal::iblBakeResources();
         if (r.initialized) return;
 
         r.eqShader  = sg_make_shader(tc_ibl_equirect_to_cube_shader_desc(sg_query_backend()));
         r.irrShader = sg_make_shader(tc_ibl_irradiance_shader_desc(sg_query_backend()));
         r.preShader = sg_make_shader(tc_ibl_prefilter_shader_desc(sg_query_backend()));
         r.lutShader = sg_make_shader(tc_ibl_brdf_lut_shader_desc(sg_query_backend()));
+        r.ready = internal::internalShaderReady(r.eqShader,  "IBL equirect-to-cube")
+               && internal::internalShaderReady(r.irrShader, "IBL irradiance")
+               && internal::internalShaderReady(r.preShader, "IBL prefilter")
+               && internal::internalShaderReady(r.lutShader, "IBL BRDF LUT");
+        if (!r.ready) {
+            r.initialized = true;   // not retried; bakes are skipped
+            return;
+        }
 
         auto makePipe = [](sg_shader sh, sg_pixel_format colorFmt) {
             sg_pipeline_desc pd = {};
@@ -261,7 +304,11 @@ private:
                                   const void* uniformData, size_t uniformSize) {
         sg_pass pass = {};
         pass.attachments.colors[0] = colorAttachment;
-        pass.action.colors[0].load_action = SG_LOADACTION_DONTCARE;
+        // Must CLEAR, not DONTCARE: on Apple TBDR GPUs (Apple Silicon Macs and
+        // Safari) a DONTCARE offscreen pass leaves tile/texture memory
+        // uninitialized, so the baked IBL cubemap/mips come back as garbage.
+        pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
+        pass.action.colors[0].clear_value = { 0.0f, 0.0f, 0.0f, 1.0f };
         sg_begin_pass(&pass);
         sg_apply_viewport(0, 0, viewportW, viewportH, true);
         sg_apply_pipeline(pipe);
@@ -280,8 +327,32 @@ private:
     // Irradiance and prefilter shaders sample the equirectangular 2D source
     // directly (not an intermediate cubemap) to avoid face-boundary seams.
     bool bakeFromEquirectTexture(const Texture& equirect) {
+#ifdef __EMSCRIPTEN__
+        // Cube-face render targets break the canvas swapchain on iOS/iPadOS
+        // Safari (all iOS browsers share the WebKit GPU backend); the page renders
+        // one frame then freezes/blacks out. A plain 2D FBO is fine, so this is
+        // specific to cube-face attachments. Desktop web, Android web and native
+        // all bake fine — so skip the bake ONLY on iOS. meshPbr then falls back to
+        // a flat hemisphere ambient (direct lights still work, looks fine).
+        // IBL is opt-in via setEnvironment(), so this only affects apps that use
+        // it; they degrade gracefully on iOS instead of breaking.
+        if (isIosWeb()) {
+            static OnceGate warned;
+            if (warned.isFirstTime()) {
+                logWarning("Environment")
+                    << "IBL bake skipped on iOS Safari (cube-face render targets "
+                       "break the canvas there). Using flat ambient + direct lights.";
+            }
+            loaded_ = false;
+            return false;
+        }
+#endif
         ensureBakeResources();
-        BakeResources& r = bake();
+        BakeResources& r = internal::iblBakeResources();
+        if (!r.ready) {   // warned once in ensureBakeResources()
+            loaded_ = false;
+            return false;
+        }
 
         // IBL bakes run outside any user-facing pass. If a swapchain pass is
         // somehow active, suspend it so we can start fresh offscreen passes.
@@ -354,22 +425,18 @@ private:
     }
 };
 
-// Forward-declared pointer to the active environment. Set via
+// The active IBL environment is per-window state (WindowContext), set via
 // setEnvironment() and consumed by PbrPipeline::drawMesh().
-namespace internal {
-    inline Environment* currentEnvironment = nullptr;
-}
-
 inline void setEnvironment(Environment& env) {
-    internal::currentEnvironment = &env;
+    internal::currentWindowContext().currentEnvironment = &env;
 }
 
 inline void clearEnvironment() {
-    internal::currentEnvironment = nullptr;
+    internal::currentWindowContext().currentEnvironment = nullptr;
 }
 
 inline Environment* getEnvironment() {
-    return internal::currentEnvironment;
+    return internal::currentWindowContext().currentEnvironment;
 }
 
 } // namespace trussc

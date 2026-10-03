@@ -1,4 +1,5 @@
 #pragma once
+#include "tc/utils/tcAnnotations.h"
 
 // =============================================================================
 // File dialog
@@ -7,32 +8,22 @@
 // All dialog functions follow unified parameter order:
 //   (title, message, ..., callback for async)
 // =============================================================================
-// NOTE: Sync dialog functions are not available on iOS.
-//       Use async versions instead (alertDialogAsync, confirmDialogAsync, etc.)
+// NOTE: Sync dialogs can't block on iOS. There they compile, log an error and
+//       return a failed result (false / success == false); use the async
+//       versions instead (alertDialogAsync, confirmDialogAsync, etc.)
 // =============================================================================
 
 #include <string>
+#include "tc/utils/tcFileIO.h"   // fs alias
 #include <vector>
 #include <functional>
-
-#if defined(__APPLE__)
-#include <TargetConditionals.h>
-#endif
-
-// Mark sync dialogs as compile error on iOS
-#if defined(__APPLE__) && TARGET_OS_IOS
-#define TC_SYNC_DIALOG_UNAVAILABLE \
-    __attribute__((unavailable("Sync dialogs are not supported on iOS. Use async version instead.")))
-#else
-#define TC_SYNC_DIALOG_UNAVAILABLE
-#endif
 
 namespace trussc {
 
 // Dialog result for load/save dialogs
 struct FileDialogResult {
-    std::string filePath;   // Full path
-    std::string fileName;   // Filename only
+    fs::path filePath;      // Full path
+    fs::path fileName;      // Filename only
     bool success = false;   // true if not cancelled
 };
 
@@ -41,8 +32,7 @@ struct FileDialogResult {
 // title: Bold header text
 // message: Body text
 // -----------------------------------------------------------------------------
-TC_SYNC_DIALOG_UNAVAILABLE
-void alertDialog(const std::string& title, const std::string& message);
+TC_PLATFORMS("macos,windows,linux,android,web") void alertDialog(const std::string& title, const std::string& message);
 
 void alertDialogAsync(const std::string& title,
                       const std::string& message,
@@ -52,8 +42,7 @@ void alertDialogAsync(const std::string& title,
 // Confirm dialog (Yes/No)
 // Returns true if user clicked Yes
 // -----------------------------------------------------------------------------
-TC_SYNC_DIALOG_UNAVAILABLE
-bool confirmDialog(const std::string& title, const std::string& message);
+TC_PLATFORMS("macos,windows,linux,android,web") bool confirmDialog(const std::string& title, const std::string& message);
 
 void confirmDialogAsync(const std::string& title,
                         const std::string& message,
@@ -63,15 +52,14 @@ void confirmDialogAsync(const std::string& title,
 // File open dialog
 // folderSelection: true for folder selection mode
 // -----------------------------------------------------------------------------
-TC_SYNC_DIALOG_UNAVAILABLE
-FileDialogResult loadDialog(const std::string& title = "",
+TC_PLATFORMS("macos,windows,linux,android") FileDialogResult loadDialog(const std::string& title = "",
                             const std::string& message = "",
-                            const std::string& defaultPath = "",
+                            const fs::path& defaultPath = {},
                             bool folderSelection = false);
 
 void loadDialogAsync(const std::string& title,
                      const std::string& message,
-                     const std::string& defaultPath,
+                     const fs::path& defaultPath,
                      bool folderSelection,
                      std::function<void(const FileDialogResult&)> callback);
 
@@ -79,16 +67,15 @@ void loadDialogAsync(const std::string& title,
 // File save dialog
 // defaultName: Initial filename
 // -----------------------------------------------------------------------------
-TC_SYNC_DIALOG_UNAVAILABLE
-FileDialogResult saveDialog(const std::string& title = "",
+TC_PLATFORMS("macos,windows,linux,android") FileDialogResult saveDialog(const std::string& title = "",
                             const std::string& message = "",
-                            const std::string& defaultPath = "",
-                            const std::string& defaultName = "");
+                            const fs::path& defaultPath = {},
+                            const fs::path& defaultName = {});
 
 void saveDialogAsync(const std::string& title,
                      const std::string& message,
-                     const std::string& defaultPath,
-                     const std::string& defaultName,
+                     const fs::path& defaultPath,
+                     const fs::path& defaultName,
                      std::function<void(const FileDialogResult&)> callback);
 
 } // namespace trussc

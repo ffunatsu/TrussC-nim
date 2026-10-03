@@ -11,12 +11,15 @@ namespace trussc {
 
 class EasyCam {
 public:
+    // Modifier key that must be held for camera mouse input (orbit / pan /
+    // zoom). Lets the camera share the mouse with scene interaction — e.g.
+    // require Shift for the camera so plain drags go to gizmos / nodes.
+    enum class Modifier { None, Shift, Ctrl, Alt, Super };
+
     EasyCam()
         : target_{0.0f, 0.0f, 0.0f}
         , upAxis_{0.0f, 1.0f, 0.0f}
         , distance_(400.0f)
-        , rotationX_(0.0f)
-        , rotationY_(0.0f)
         , fov_(0.785398f)  // 45 degrees (radians)
         , nearClip_(0.1f)
         , farClip_(10000.0f)
@@ -36,28 +39,57 @@ public:
 
     // Start camera mode (set 3D perspective + view matrix)
     void begin() {
-        // Enable 3D pipeline
-        if (internal::pipeline3dInitialized) {
-            sgl_load_pipeline(internal::pipeline3d);
-        }
+        // 3D pipeline for the active target (swapchain or FBO) — RenderTarget picks
+        // the format-correct one; no per-site swapchain/FBO branch.
+        internal::loadPipeline(internal::active3D());
 
-        float dpiScale = sapp_dpi_scale();
-        float w = (float)sapp_width() / dpiScale;
-        float h = (float)sapp_height() / dpiScale;
+        float dpiScale = getDpiScale();
+        float w = (float)getFramebufferWidth() / dpiScale;
+        float h = (float)getFramebufferHeight() / dpiScale;
         float aspect = w / h;
 
-        // Calculate camera position from spherical coordinates
-        Vec3 eye = calcEyePosition();
+        // Camera basis from orientation quaternion (no gimbal lock / no pole
+        // singularity, so straight-down top-down views are valid).
+        Vec3 eye   = eyePosition();
+        Vec3 camUp = orientation_.rotate(Vec3(0.0f, 1.0f, 0.0f));
 
         // Create matrices using Mat4 (row-major)
-        Mat4 projection = Mat4::perspective(fov_, aspect, nearClip_, farClip_);
-        Mat4 view = Mat4::lookAt(eye, target_, upAxis_);
+        Mat4 projection;
+        if (orthoEnabled_) {
+            // Zoom is driven by distance_ in both modes, so toggling ortho /
+            // perspective keeps the same apparent size at the target plane.
+            // Perspective shows a world height of 2*distance*tan(fov/2) there;
+            // ortho uses the same extent (no orthoZoom_ — distance_ is the one
+            // source of zoom).
+            float halfH = distance_ * std::tan(fov_ * 0.5f);
+            float halfW = halfH * aspect;
+            projection = Mat4::ortho(-halfW, halfW, -halfH, halfH, nearClip_, farClip_);
+        } else {
+            projection = Mat4::perspective(fov_, aspect, nearClip_, farClip_);
+        }
+
+        // Mat4::ortho/perspective emit the GL clip-z convention (NDC z in
+        // [-1, 1]); D3D11/Metal/WebGPU expect [0, 1]. Without remapping,
+        // ortho geometry near the target plane lands in the clipped near
+        // half and disappears (perspective only survives because its
+        // non-linear depth keeps far geometry inside [0,1]). All projection
+        // matrices are stored and uploaded backend-native — see
+        // tc/graphics/tcClipSpace.h (#134).
+        projection = internal::toBackendClip(projection);
+
+        // camUp is orthogonal to the view direction by construction, so lookAt
+        // never degenerates (even looking straight down the world up axis).
+        Mat4 view = Mat4::lookAt(eye, target_, camUp);
 
         // Save for worldToScreen/screenToWorld
-        internal::currentProjectionMatrix = projection;
-        internal::currentViewMatrix = view;
-        internal::currentViewW = w;
-        internal::currentViewH = h;
+        internal::currentWindowContext().currentProjectionMatrix = projection;
+        internal::currentWindowContext().currentViewMatrix = view;
+        internal::currentWindowContext().currentViewW = w;
+        internal::currentWindowContext().currentViewH = h;
+
+        // Register this camera scope: nodes drawn between begin()/end() stamp
+        // it, so mouse picking unprojects through THIS camera for them.
+        internal::registerCameraContext(view, projection, w, h, true);
 
         // Apply to SGL (needs column-major, so transpose)
         Mat4 projT = projection.transposed();
@@ -83,8 +115,7 @@ public:
     void reset() {
         target_ = {0.0f, 0.0f, 0.0f};
         distance_ = 400.0f;
-        rotationX_ = 0.0f;
-        rotationY_ = 0.0f;
+        orientation_ = baseOrientation();   // azimuth 0, elevation 0
     }
 
     // ---------------------------------------------------------------------------
@@ -106,12 +137,15 @@ public:
 
     // Set up axis for the camera coordinate system.
     // Default is Y-up (0,1,0). Use (0,0,1) for Z-up (scientific/VQF convention).
+    // Rebuilds orientation to the azimuth-0 / elevation-0 pose for the new up
+    // axis. Call this at setup time, before any setAzimuth/setElevation.
     void setUpAxis(const Vec3& up) {
         upAxis_ = up;
+        orientation_ = baseOrientation();
     }
 
     void setUpAxis(float x, float y, float z) {
-        upAxis_ = {x, y, z};
+        setUpAxis(Vec3{x, y, z});
     }
 
     Vec3 getUpAxis() const {
@@ -127,6 +161,52 @@ public:
     float getDistance() const {
         return distance_;
     }
+
+    // ---------------------------------------------------------------------------
+    // Orbit angles
+    // ---------------------------------------------------------------------------
+    // The camera orbits the target on a sphere, placed by two angles:
+    //   azimuth   - horizontal angle (yaw): which side you view from, spinning
+    //               around the up axis. 0 looks along the forward axis.
+    //   elevation - vertical angle (pitch): how high above the target you look
+    //               down from. 0 = level (side-on); positive looks downward.
+    // Both in radians. Set them to frame an oblique 3/4 view at startup instead
+    // of the default head-on side view. With the quaternion orientation there is
+    // no pole singularity, so elevation is NOT clamped: deg2rad(90) gives a true
+    // straight-down top-down view.
+    void setAzimuth(float radians) {
+        setOrbit(radians, getElevation());
+    }
+
+    void setElevation(float radians) {
+        setOrbit(getAzimuth(), radians);
+    }
+
+    // Derived live from the orientation (consistent with mouse-drag too).
+    float getElevation() const {
+        Vec3 back = orientation_.rotate(Vec3(0.0f, 0.0f, 1.0f));
+        float d = back.dot(upAxis_);
+        if (d >  1.0f) d =  1.0f;
+        if (d < -1.0f) d = -1.0f;
+        return std::asin(d);
+    }
+
+    float getAzimuth() const {
+        Vec3 right, forward;
+        getOrbitAxes(right, forward);
+        Vec3 back = orientation_.rotate(Vec3(0.0f, 0.0f, 1.0f));
+        return std::atan2(back.dot(right), back.dot(forward));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Orthographic projection (oF-compatible: ofCamera::enableOrtho)
+    // ---------------------------------------------------------------------------
+    // When enabled, begin() uses an orthographic projection instead of
+    // perspective. distance_ (mouse wheel / setDistance) still acts as zoom.
+    void enableOrtho()  { orthoEnabled_ = true; }
+    void disableOrtho() { orthoEnabled_ = false; }
+    void setOrtho(bool ortho) { orthoEnabled_ = ortho; }
+    bool getOrtho() const { return orthoEnabled_; }
 
     // Set field of view (FOV) in radians
     void setFov(float fov) {
@@ -164,6 +244,25 @@ public:
         panSensitivity_ = s;
     }
 
+    // ---------------------------------------------------------------------------
+    // Mouse bindings — which inputs drive the camera
+    // ---------------------------------------------------------------------------
+
+    // Mouse button that orbits (default: left)
+    EasyCam& setOrbitButton(int button) { orbitButton_ = button; return *this; }
+    int getOrbitButton() const { return orbitButton_; }
+
+    // Mouse button that pans (default: middle)
+    EasyCam& setPanButton(int button) { panButton_ = button; return *this; }
+    int getPanButton() const { return panButton_; }
+
+    // Modifier key required for camera input (orbit / pan / zoom). Checked at
+    // press / scroll time; a drag that started with the modifier held keeps
+    // the camera until release even if the modifier is let go mid-gesture.
+    // Default: Modifier::None (no modifier needed).
+    EasyCam& setDragModifier(Modifier m) { dragModifier_ = m; return *this; }
+    Modifier getDragModifier() const { return dragModifier_; }
+
     // Constrain mouse input to a specific screen area.
     // Only mouse events inside this rect will be processed.
     // Pass an empty rect (width or height <= 0) to clear the constraint.
@@ -178,6 +277,13 @@ public:
 
     // ---------------------------------------------------------------------------
     // Mouse input (auto-subscribe to events)
+    //
+    // Multi-window contract: the listeners bind to the CURRENT window's event
+    // streams at the moment enableMouseInput() is called (events() resolves
+    // per window). Call it from within the lifecycle of the App that drives
+    // the camera's window -- setup()/update()/draw() of a secondary window's
+    // App binds to THAT window; calling it from the main App and then using
+    // the camera in a secondary window would listen to the wrong stream.
     // ---------------------------------------------------------------------------
 
     void enableMouseInput() {
@@ -186,20 +292,29 @@ public:
 
         // Subscribe to mouse events
         listenerMoved_ = events().mouseMoved.listen([this](MouseMoveEventArgs& e) {
-            lastMouseX_ = e.x;
-            lastMouseY_ = e.y;
+            lastMouseX_ = e.pos.x;
+            lastMouseY_ = e.pos.y;
         });
+        // The camera CONSUMES the gestures it claims (same consume + capture
+        // contract as other overlay consumers): a press that starts an orbit /
+        // pan owns the whole gesture, so the node tree never sees a click,
+        // drag or release that was camera input.
         listenerPressed_ = events().mousePressed.listen([this](MouseEventArgs& e) {
-            onMousePressed(e.x, e.y, e.button);
+            // Gestures are claimed at press time: no modifier, no camera.
+            if (!modifierHeld(e.shift, e.ctrl, e.alt, e.super)) return;
+            if (onMousePressed(e.pos.x, e.pos.y, e.button)) e.consumed = true;
         });
         listenerReleased_ = events().mouseReleased.listen([this](MouseEventArgs& e) {
-            onMouseReleased(e.x, e.y, e.button);
+            // Never gated on the modifier — a release must always be able to
+            // end an in-flight gesture (even if the modifier was let go).
+            if (onMouseReleased(e.pos.x, e.pos.y, e.button)) e.consumed = true;
         });
         listenerDragged_ = events().mouseDragged.listen([this](MouseDragEventArgs& e) {
-            onMouseDragged(e.x, e.y, e.button);
+            if (onMouseDragged(e.pos.x, e.pos.y, e.button)) e.consumed = true;
         });
         listenerScrolled_ = events().mouseScrolled.listen([this](ScrollEventArgs& e) {
-            onMouseScrolled(e.scrollX, e.scrollY);
+            if (!modifierHeld(e.shift, e.ctrl, e.alt, e.super)) return;
+            if (onMouseScrolled(e.scroll.x, e.scroll.y)) e.consumed = true;
         });
     }
 
@@ -243,22 +358,42 @@ private:
         }
     }
 
-    // Calculate eye position from spherical coordinates + upAxis
-    Vec3 calcEyePosition() const {
-        Vec3 right, forward;
-        getOrbitAxes(right, forward);
+    // Shortest-arc rotation that takes unit vector a onto unit vector b.
+    static Quaternion rotationFromTo(Vec3 a, Vec3 b) {
+        a = a.normalized();
+        b = b.normalized();
+        float d = a.dot(b);
+        if (d >  0.999999f) return Quaternion();                 // already aligned
+        if (d < -0.999999f) {                                    // opposite: 180°
+            Vec3 axis = Vec3(1.0f, 0.0f, 0.0f).cross(a);
+            if (axis.dot(axis) < 1e-6f) axis = Vec3(0.0f, 0.0f, 1.0f).cross(a);
+            return Quaternion::fromAxisAngle(axis.normalized(), HALF_TAU);
+        }
+        Vec3 axis = a.cross(b).normalized();
+        return Quaternion::fromAxisAngle(axis, std::acos(d));
+    }
 
-        float cosEl = cos(rotationX_);
-        float sinEl = sin(rotationX_);
-        float cosAz = cos(rotationY_);
-        float sinAz = sin(rotationY_);
+    // Orientation for azimuth 0 / elevation 0 with the current up axis.
+    // Maps local +Y -> upAxis (and consistently +Z -> forward, +X -> right).
+    Quaternion baseOrientation() const {
+        return rotationFromTo(Vec3(0.0f, 1.0f, 0.0f), upAxis_);
+    }
 
-        // Orbit: horizontal circle in right/forward plane, vertical along upAxis
-        return {
-            target_.x + distance_ * (right.x * sinAz * cosEl + forward.x * cosAz * cosEl + upAxis_.x * sinEl),
-            target_.y + distance_ * (right.y * sinAz * cosEl + forward.y * cosAz * cosEl + upAxis_.y * sinEl),
-            target_.z + distance_ * (right.z * sinAz * cosEl + forward.z * cosAz * cosEl + upAxis_.z * sinEl)
-        };
+    // Build orientation_ from spherical orbit angles via composed axis-angle
+    // rotations (valid at every angle, including the poles).
+    void setOrbit(float azimuth, float elevation) {
+        Quaternion base    = baseOrientation();
+        Quaternion qAz     = Quaternion::fromAxisAngle(upAxis_, azimuth);
+        Quaternion afterAz = (qAz * base);
+        Vec3 right         = afterAz.rotate(Vec3(1.0f, 0.0f, 0.0f));
+        Quaternion qEl     = Quaternion::fromAxisAngle(right, -elevation);
+        orientation_       = (qEl * afterAz).normalized();
+    }
+
+    // Eye position: target plus the camera's "back" direction times distance.
+    Vec3 eyePosition() const {
+        Vec3 back = orientation_.rotate(Vec3(0.0f, 0.0f, 1.0f));
+        return target_ + back * distance_;
     }
 
     bool isInsideControlArea(float x, float y) const {
@@ -267,78 +402,91 @@ private:
             && y >= controlArea_.y && y <= controlArea_.y + controlArea_.height;
     }
 
-    // Internal mouse handlers
-    void onMousePressed(float x, float y, int button) {
-        if (!isInsideControlArea(x, y)) return;
+    // Required drag modifier held? (None -> always true)
+    bool modifierHeld(bool shift, bool ctrl, bool alt, bool super) const {
+        switch (dragModifier_) {
+            case Modifier::Shift: return shift;
+            case Modifier::Ctrl:  return ctrl;
+            case Modifier::Alt:   return alt;
+            case Modifier::Super: return super;
+            case Modifier::None:  return true;
+        }
+        return true;
+    }
+
+    // Internal mouse handlers. Each returns true when the camera claimed the
+    // input (drives event consumption in the listeners above).
+    bool onMousePressed(float x, float y, int button) {
+        if (!isInsideControlArea(x, y)) return false;
 
         lastMouseX_ = x;
         lastMouseY_ = y;
 
-        if (button == MOUSE_BUTTON_LEFT) {
+        if (button == orbitButton_) {
             isDragging_ = true;
-        } else if (button == MOUSE_BUTTON_MIDDLE) {
+            return true;
+        } else if (button == panButton_) {
             isPanning_ = true;
+            return true;
         }
+        return false;
     }
 
-    void onMouseReleased(float x, float y, int button) {
+    bool onMouseReleased(float x, float y, int button) {
         (void)x; (void)y;
-        if (button == MOUSE_BUTTON_LEFT) {
+        if (button == orbitButton_ && isDragging_) {
             isDragging_ = false;
-        } else if (button == MOUSE_BUTTON_MIDDLE) {
+            return true;
+        } else if (button == panButton_ && isPanning_) {
             isPanning_ = false;
+            return true;
         }
+        return false;
     }
 
-    void onMouseDragged(float x, float y, int button) {
+    bool onMouseDragged(float x, float y, int button) {
         float dx = x - lastMouseX_;
         float dy = y - lastMouseY_;
+        bool claimed = false;
 
-        if (isDragging_ && button == MOUSE_BUTTON_LEFT) {
-            // Rotation (Y drag for elevation, X drag for azimuth)
-            rotationY_ -= dx * 0.01f * sensitivity_;
-            rotationX_ += dy * 0.01f * sensitivity_;  // Intuitive up/down
-
-            // Limit elevation to ~80 degrees to prevent flipping near poles
-            float maxAngle = 1.4f;
-            if (rotationX_ > maxAngle) rotationX_ = maxAngle;
-            if (rotationX_ < -maxAngle) rotationX_ = -maxAngle;
-        } else if (isPanning_ && button == MOUSE_BUTTON_MIDDLE) {
-            Vec3 right, forward;
-            getOrbitAxes(right, forward);
-
-            // Camera's horizontal right direction (rotated by azimuth)
-            float cosAz = cos(rotationY_);
-            float sinAz = sin(rotationY_);
-            Vec3 camRight = {
-                right.x * cosAz + forward.x * sinAz,
-                right.y * cosAz + forward.y * sinAz,
-                right.z * cosAz + forward.z * sinAz
-            };
+        if (isDragging_ && button == orbitButton_) {
+            claimed = true;
+            // Yaw about the world up axis, pitch about the camera's right axis.
+            // Accumulated on the quaternion, so it can orbit fully overhead with
+            // no gimbal lock and no elevation clamp.
+            Quaternion qYaw   = Quaternion::fromAxisAngle(upAxis_, -dx * 0.01f * sensitivity_);
+            Vec3 camRight     = orientation_.rotate(Vec3(1.0f, 0.0f, 0.0f));
+            Quaternion qPitch = Quaternion::fromAxisAngle(camRight, -dy * 0.01f * sensitivity_);
+            orientation_ = (qYaw * qPitch * orientation_).normalized();
+        } else if (isPanning_ && button == panButton_) {
+            claimed = true;
+            // Pan in the camera's own right/up plane.
+            Vec3 camRight = orientation_.rotate(Vec3(1.0f, 0.0f, 0.0f));
+            Vec3 camUp    = orientation_.rotate(Vec3(0.0f, 1.0f, 0.0f));
 
             float panX = dx * 0.5f * panSensitivity_;
-            float panY = -dy * 0.5f * panSensitivity_;
+            float panY = dy * 0.5f * panSensitivity_;
 
-            // Pan: horizontal along camRight, vertical along upAxis
-            target_.x -= camRight.x * panX - upAxis_.x * panY;
-            target_.y -= camRight.y * panX - upAxis_.y * panY;
-            target_.z -= camRight.z * panX - upAxis_.z * panY;
+            target_ = target_ - camRight * panX + camUp * panY;
         }
 
         lastMouseX_ = x;
         lastMouseY_ = y;
+        return claimed;
     }
 
-    void onMouseScrolled(float dx, float dy) {
+    bool onMouseScrolled(float dx, float dy) {
         (void)dx;
         // Check control area using current mouse position
         float mx = lastMouseX_;
         float my = lastMouseY_;
-        if (!isInsideControlArea(mx, my)) return;
+        if (!isInsideControlArea(mx, my)) return false;
 
-        // Zoom (change distance)
+        // Wheel changes distance to the target in both modes; ortho derives its
+        // extent from distance_, so the zoom feel stays consistent across toggle.
         distance_ -= dy * zoomSensitivity_;
         if (distance_ < 0.1f) distance_ = 0.1f;
+        return true;
     }
 
 public:
@@ -349,25 +497,34 @@ public:
 
     // Get camera position
     Vec3 getPosition() const {
-        return calcEyePosition();
+        return eyePosition();
     }
+
+    // Direct access to the camera orientation quaternion.
+    Quaternion getOrientation() const { return orientation_; }
+    void setOrientation(const Quaternion& q) { orientation_ = q.normalized(); }
 
 private:
     Vec3 target_;         // Look-at target
     Vec3 upAxis_;         // Up axis (default Y-up, set to Z-up for scientific coords)
     float distance_;      // Distance from target
-    float rotationX_;     // Elevation angle (radians)
-    float rotationY_;     // Azimuth angle (radians)
+    Quaternion orientation_;  // Camera orientation (gimbal-lock free)
 
     float fov_;           // Field of view (radians)
     float nearClip_;      // Near clipping plane
     float farClip_;       // Far clipping plane
 
+    bool orthoEnabled_ = false;  // Orthographic projection (vs perspective)
     bool mouseInputEnabled_;
-    bool isDragging_;     // Left button dragging
-    bool isPanning_;      // Middle button dragging
+    bool isDragging_;     // Orbit-button dragging
+    bool isPanning_;      // Pan-button dragging
     float lastMouseX_;
     float lastMouseY_;
+
+    // Mouse bindings (see setOrbitButton / setPanButton / setDragModifier)
+    int orbitButton_ = (int)MOUSE_BUTTON_LEFT;
+    int panButton_ = (int)MOUSE_BUTTON_MIDDLE;
+    Modifier dragModifier_ = Modifier::None;
 
     float sensitivity_;       // Rotation sensitivity
     float zoomSensitivity_;   // Zoom sensitivity

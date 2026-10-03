@@ -51,94 +51,105 @@ public:
     // Settings
     // =========================================================================
 
-    void setWidth(float width) {
+    StrokeMesh& setWidth(float width) {
         strokeWidth_ = width;
         bDirty_ = true;
+        return *this;
     }
 
-    void setColor(const Color& color) {
+    StrokeMesh& setColor(const Color& color) {
         strokeColor_ = color;
         bDirty_ = true;
+        return *this;
     }
 
-    void setCapType(CapType type) {
+    StrokeMesh& setCapType(CapType type) {
         capType_ = type;
         bDirty_ = true;
+        return *this;
     }
 
-    void setJoinType(JoinType type) {
+    StrokeMesh& setJoinType(JoinType type) {
         joinType_ = type;
         bDirty_ = true;
+        return *this;
     }
 
     // How much sharpness to allow with Miter Join
-    void setMiterLimit(float limit) {
+    StrokeMesh& setMiterLimit(float limit) {
         miterLimit_ = limit;
         bDirty_ = true;
+        return *this;
     }
 
     // =========================================================================
     // Input
     // =========================================================================
 
-    void addVertex(float x, float y, float z = 0) {
-        addVertex(Vec3{x, y, z});
+    StrokeMesh& addVertex(float x, float y, float z = 0) {
+        return addVertex(Vec3{x, y, z});
     }
 
-    void addVertex(const Vec3& p) {
+    StrokeMesh& addVertex(const Vec3& p) {
         if (polylines_.empty()) {
             polylines_.push_back(Path());
         }
         polylines_[0].addVertex(p);
         bDirty_ = true;
+        return *this;
     }
 
-    void addVertex(const Vec2& p) {
-        addVertex(Vec3{p.x, p.y, 0});
+    StrokeMesh& addVertex(const Vec2& p) {
+        return addVertex(Vec3{p.x, p.y, 0});
     }
 
     // Add vertex and width together (for variable width strokes)
-    void addVertexWithWidth(float x, float y, float width) {
-        addVertexWithWidth(Vec3{x, y, 0}, width);
+    StrokeMesh& addVertexWithWidth(float x, float y, float width) {
+        return addVertexWithWidth(Vec3{x, y, 0}, width);
     }
 
-    void addVertexWithWidth(const Vec3& p, float width) {
+    StrokeMesh& addVertexWithWidth(const Vec3& p, float width) {
         if (polylines_.empty()) {
             polylines_.push_back(Path());
         }
         polylines_[0].addVertex(p);
         widths_.push_back(width);
         bDirty_ = true;
+        return *this;
     }
 
     // Set width array directly
-    void setWidths(const std::vector<float>& w) {
+    StrokeMesh& setWidths(const std::vector<float>& w) {
         widths_ = w;
         bDirty_ = true;
+        return *this;
     }
 
     // Set and overwrite existing shape
-    void setShape(const Path& polyline) {
+    StrokeMesh& setShape(const Path& polyline) {
         polylines_.clear();
         polylines_.push_back(polyline);
         widths_.clear();
         bClosed_ = polyline.isClosed();
         bDirty_ = true;
+        return *this;
     }
 
     // Whether to make closed shape
-    void setClosed(bool closed) {
+    StrokeMesh& setClosed(bool closed) {
         bClosed_ = closed;
         bDirty_ = true;
+        return *this;
     }
 
     // Clear
-    void clear() {
+    StrokeMesh& clear() {
         polylines_.clear();
         polylines_.push_back(Path());
         widths_.clear();
         mesh_.clear();
         bDirty_ = true;
+        return *this;
     }
 
     // =========================================================================
@@ -468,24 +479,20 @@ private:
                     Vec3 n2 = getNormal(curr, next);
                     Vec3 avgNormal = normalize(Vec3{n1.x + n2.x, n1.y + n2.y, n1.z + n2.z});
 
-                    Vec3 d1 = normalize(Vec3{curr.x - prev.x, curr.y - prev.y, curr.z - prev.z});
-                    Vec3 d2 = normalize(Vec3{next.x - curr.x, next.y - curr.y, next.z - curr.z});
-                    float cross = d1.x * d2.y - d1.y * d2.x;
-                    bool turnsLeft = cross > 0;
-
                     float dotVal = dot(n1, avgNormal);
                     if (dotVal < 0.001f) dotVal = 0.001f;
                     float miterLength = 1.0f / dotVal;
 
                     if (miterLength <= miterLimit_) {
+                        // Both sides extend to the miter point — this preserves the
+                        // perpendicular stroke width across the join. Using avgNormal
+                        // on the inside (shorter) would pinch the stroke thinner near
+                        // the joint. Inner vertex may overshoot the spine on sharp
+                        // angles (self-intersecting geometry), but the rasterized area
+                        // is still correct; miterLimit_ guards against extreme cases.
                         Vec3 miterNormal = Vec3{avgNormal.x * miterLength, avgNormal.y * miterLength, avgNormal.z * miterLength};
-                        if (turnsLeft) {
-                            leftPt = Vec3{curr.x + miterNormal.x * hw, curr.y + miterNormal.y * hw, curr.z};
-                            rightPt = Vec3{curr.x - avgNormal.x * hw, curr.y - avgNormal.y * hw, curr.z};
-                        } else {
-                            leftPt = Vec3{curr.x + avgNormal.x * hw, curr.y + avgNormal.y * hw, curr.z};
-                            rightPt = Vec3{curr.x - miterNormal.x * hw, curr.y - miterNormal.y * hw, curr.z};
-                        }
+                        leftPt = Vec3{curr.x + miterNormal.x * hw, curr.y + miterNormal.y * hw, curr.z};
+                        rightPt = Vec3{curr.x - miterNormal.x * hw, curr.y - miterNormal.y * hw, curr.z};
                     } else {
                         leftPt = Vec3{curr.x + avgNormal.x * hw, curr.y + avgNormal.y * hw, curr.z};
                         rightPt = Vec3{curr.x - avgNormal.x * hw, curr.y - avgNormal.y * hw, curr.z};
@@ -585,16 +592,37 @@ private:
 // endStroke() implementation (uses StrokeMesh)
 // ===========================================================================
 inline void endStroke(bool close) {
-    if (!internal::strokeStarted || internal::strokeVertices.empty()) {
-        internal::strokeStarted = false;
+    auto& wctx = internal::currentWindowContext();
+    if (!wctx.strokeStarted || wctx.strokeVertices.empty()) {
+        wctx.strokeStarted = false;
         return;
     }
 
-    auto& verts = internal::strokeVertices;
+    auto& verts = wctx.strokeVertices;
     if (verts.size() < 2) {
-        internal::strokeVertices.clear();
-        internal::strokeStarted = false;
+        wctx.strokeVertices.clear();
+        wctx.strokeStarted = false;
         return;
+    }
+
+    // When closing, drop a trailing duplicate of the first vertex so that
+    // the natural idiom
+    //     for (int i = 0; i <= N; i++) vertex(cos(TAU*i/N), sin(TAU*i/N));
+    //     endStroke(true);
+    // doesn't produce a degenerate zero-length segment between the last and
+    // first vertex (which used to cause a NaN normal at the closing join
+    // and render as a spike/notch). Tolerance is tied to the stroke width
+    // so sub-pixel duplicates count regardless of coordinate scale.
+    if (close && verts.size() >= 3) {
+        const auto& a = verts.front().pos;
+        const auto& b = verts.back().pos;
+        const float dx = a.x - b.x;
+        const float dy = a.y - b.y;
+        const float w  = verts.back().width;
+        const float tol = std::max(1e-4f, w * 0.01f);
+        if (dx * dx + dy * dy < tol * tol) {
+            verts.pop_back();
+        }
     }
 
     auto& ctx = getDefaultContext();
@@ -619,7 +647,7 @@ inline void endStroke(bool close) {
 
     // Build StrokeMesh from stroke vertices
     StrokeMesh stroke;
-    stroke.setCapType(toMeshCap(internal::strokeStartCap));  // Start cap from first vertex
+    stroke.setCapType(toMeshCap(wctx.strokeStartCap));  // Start cap from first vertex
     stroke.setJoinType(toMeshJoin(ctx.getStrokeJoin()));
 
     // Add vertices with per-vertex width
@@ -637,8 +665,8 @@ inline void endStroke(bool close) {
     stroke.update();
     stroke.draw();
 
-    internal::strokeVertices.clear();
-    internal::strokeStarted = false;
+    wctx.strokeVertices.clear();
+    wctx.strokeStarted = false;
 }
 
 // ===========================================================================

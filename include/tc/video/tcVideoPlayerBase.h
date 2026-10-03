@@ -8,7 +8,9 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include <filesystem>
 #include "tc/gpu/tcHasTexture.h"
+#include "tc/utils/tcLoadResult.h"
 
 namespace trussc {
 
@@ -28,7 +30,7 @@ public:
     // Load / Close (must be implemented by derived class)
     // =========================================================================
 
-    virtual bool load(const std::string& path) = 0;
+    virtual LoadResult load(const fs::path& path) = 0;
     virtual void close() = 0;
     virtual bool isLoaded() const { return initialized_; }
 
@@ -38,7 +40,10 @@ public:
 
     virtual void play() {
         if (!initialized_) return;
-        firstFrameReceived_ = false;
+        // NOTE: firstFrameReceived_ (isReady) is NOT reset here - the texture
+        // still holds the last picture, so drawing does not show black.
+        // It resets only when the texture actually goes empty/black:
+        // load(), stop() (clears the texture) and close().
         done_ = false;
         playImpl();
         playing_ = true;
@@ -55,7 +60,10 @@ public:
         playing_ = false;
         paused_ = false;
         done_ = false;
-        firstFrameReceived_ = false;
+        // firstFrameReceived_ (isReady) is kept: the texture still holds a
+        // real picture (players poster frame 0 on stop, or keep the last
+        // frame). It only resets on load()/close(), when the texture is
+        // actually empty.
     }
 
     virtual void setPaused(bool paused) {
@@ -81,6 +89,11 @@ public:
     bool isPlaying() const { return playing_ && !paused_; }
     bool isPaused() const { return paused_; }
     bool isFrameNew() const { return frameNew_ && firstFrameReceived_; }
+    // True while the texture holds a real picture — i.e. drawing shows
+    // actual video, not the cleared (black) texture. False only between
+    // load() and the first picture (poster or decoded frame); play(),
+    // stop(), seeking and pausing all keep a real picture on the texture.
+    bool isReady() const { return firstFrameReceived_; }
     bool isDone() const { return done_; }
 
     // =========================================================================
@@ -211,8 +224,10 @@ public:
 
     /// Set the maximum allowed video/audio drift (in seconds) before a hard
     /// re-sync (video seeks to the audio position). Set to 0 or negative to
-    /// disable. Primarily affects the Linux (FFmpeg) backend — other
-    /// platforms delegate sync to their native framework.
+    /// disable hard re-sync. Affects the Linux (FFmpeg) backend and tcxHap's
+    /// HapPlayer, which slews wall-clock time toward playing audio and uses
+    /// this threshold for hard re-sync. Slewing remains enabled when <= 0.
+    /// Other platforms delegate sync to their native framework.
     /// Default: 0.5s
     virtual void setResyncThreshold(float seconds) { resyncThreshold_ = seconds; }
 

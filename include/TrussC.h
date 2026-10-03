@@ -2,19 +2,27 @@
 
 // =============================================================================
 // TrussC - Thin, Modern, and Native Creative Coding Framework
-// Version 0.0.1
 // =============================================================================
 
 // Windows: Hide console window (in Release builds)
-// Define TRUSSC_SHOW_CONSOLE to always show console
-#if defined(_WIN32) && !defined(_DEBUG) && !defined(TRUSSC_SHOW_CONSOLE)
+// Define TRUSSC_SHOW_CONSOLE to always show console.
+//
+// This must fire ONLY in the app's own translation units, never in a library
+// (core TrussC or an addon static lib). A library object that emits the
+// /subsystem:windows directive forces the GUI subsystem onto the final image via
+// its .drectve, which overrides the command-line /SUBSYSTEM — so a single
+// GUI-header-including library (core, or e.g. a networking addon) would silently
+// turn a console tool into a GUI app that detaches from its launcher. The build
+// defines TRUSSC_LIBRARY_TU when compiling the TrussC lib and every addon; the
+// app's own main TU has neither define, so GUI apps still pin /subsystem:windows.
+#if defined(_WIN32) && !defined(_DEBUG) && !defined(TRUSSC_SHOW_CONSOLE) && !defined(TRUSSC_LIBRARY_TU)
 #pragma comment(linker, "/subsystem:\"windows\" /entry:\"mainCRTStartup\"")
 #endif
 
 // sokol headers
 #include "sokol/sokol_log.h"
 #define SOKOL_NO_ENTRY  // We define our own main()
-#include "sokol/sokol_app.h"
+#include "sokol/sokol_app_tc.h"
 #include "sokol/sokol_gfx.h"
 #include "sokol/sokol_glue.h"
 #include "sokol/util/sokol_gl_tc.h"
@@ -27,8 +35,12 @@
 #include <vector>
 #include <chrono>
 #include <atomic>
+#include <functional>
 #include <fstream>
 #include <unordered_set>
+
+// Reference-generator annotation macros (no-op except under Clang)
+#include "tc/utils/tcAnnotations.h"
 
 // Headless mode state (must be included early for graphics skip checks)
 #include "tc/app/tcHeadlessState.h"
@@ -56,6 +68,12 @@
 // TrussC ray (for hit testing)
 #include "tc/math/tcRay.h"
 
+// Clip-space Z convention helpers (single source of truth, #134)
+#include "tc/graphics/tcClipSpace.h"
+
+// Camera snapshot for draw-time stamping & picking
+#include "tc/graphics/tcCameraContext.h"
+
 // TrussC FFT (Fast Fourier Transform)
 #include "tc/math/tcFFT.h"
 
@@ -71,6 +89,9 @@
 // TrussC graphics backend detection (runtime query of sokol_gfx backend)
 #include "tc/graphics/tcBackend.h"
 
+// GPU destroy queue (deferred sg_destroy_* — see header for why)
+#include "tc/gpu/tcGpuDestroyQueue.h"
+
 // TrussC build info (populated by trussc_app() at CMake configure time)
 #include "tcBuildInfo.h"
 
@@ -78,15 +99,20 @@
 #include "tc/events/tcCoreEvents.h"
 
 // TrussC utilities
+#include "tc/utils/tcFileIO.h"   // fs::path boundary helpers (before all path consumers)
 #include "tc/utils/tcUtils.h"
+#include "tc/utils/tcMainThread.h"  // runOnMainThread / drainMainThreadQueue
 #include "tc/utils/tcTime.h"
 #include "tc/utils/tcLog.h"
+#include "tc/utils/tcOnceGate.h"  // OnceGate (warn-once gates)
+#include "tc/utils/tcCompress.h"
 
 // TrussC file dialogs
 #include "tc/utils/tcFileDialog.h"
 
 // TrussC JSON/XML
 #include "tc/utils/tcJson.h"
+#include "tc/utils/tcJsonReflect.h"
 #include "tc/utils/tcXml.h"
 
 // TrussC file utilities
@@ -94,6 +120,9 @@
 
 // TrussC console input (accept commands from stdin)
 #include "tc/utils/tcConsole.h"
+
+// TrussC version (git-tag derived, see tcVersion.h)
+#include "tc/utils/tcVersion.h"
 
 // TrussC MCP (Model Context Protocol) Server
 #include "tc/utils/tcMCP.h"
@@ -114,6 +143,7 @@ enum class BlendMode {
     Subtract,   // Subtractive blending
     Disabled    // No blending (overwrite)
 };
+TC_ENUM_LABELS(BlendMode, "Alpha", "Add", "Multiply", "Screen", "Subtract", "Disabled")
 
 // ---------------------------------------------------------------------------
 // Texture filter
@@ -133,65 +163,64 @@ enum class TextureWrap {
 };
 
 // Forward declarations (for RenderContext)
+//
+// The state behind the accessors below is defined in tcGlobal.cpp, not inline
+// here: host code (the frame loop, RenderContext) and app code both use it, and
+// a Windows hot reload guest DLL would get its own copy of an inline variable
+// (docs/ARCHITECTURE.md, "One instance per process").
 namespace internal {
-    inline sg_image fontTexture = {};
-    inline sg_view fontView = {};
-    inline sg_sampler fontSampler = {};
-    inline sgl_pipeline fontPipeline = {};
-    inline bool fontInitialized = false;
-    inline sgl_pipeline pipeline3d = {};
-    inline bool pipeline3dInitialized = false;
-    inline bool pixelPerfectMode = false;
+    // Bitmap font GPU state.
+    struct BitmapFontAtlas {
+        sg_image   texture = {};
+        sg_view    view = {};
+        sg_sampler sampler = {};
+        // True once the bitmap-font sampler is created (cheap, done at startup).
+        // Bitmap text draws through the active RenderTarget's Fill2D pipeline
+        // now, so there is no dedicated font pipeline.
+        bool initialized = false;
+        // Atlas texture state — allocated lazily on first drawBitmapString call,
+        // grown row-by-row as new codepoint ranges are encountered, and rebuilt
+        // whenever the registry changes (via registerGlyph / updateGlyph).
+        bool     atlasInitialized = false;
+        int      rows = 0;                  // height of current atlas in cell rows
+        uint64_t version = 0;               // last bitmapfont registryVersion() baked in
+        uint64_t uploadFrame = UINT64_MAX;  // frame of last sg_update_image
+    };
+    BitmapFontAtlas& bitmapFontAtlas();
+
+    // WindowSettings::pixelPerfect (set by the launcher): coordinates are
+    // framebuffer pixels instead of DPI-scaled points.
+    bool& pixelPerfectMode();
 
     // Default screen FOV (45 = perspective ~28mm equivalent, 0 = ortho)
-    inline float defaultScreenFov = 45.0f;
+    float& defaultScreenFov();
 
     // Near/far clip overrides (0 = auto-calculate based on camera distance)
-    inline float nearClipOverride = 0.0f;
-    inline float farClipOverride = 0.0f;
+    float& nearClipOverride();
+    float& farClipOverride();
 
-    // Current screen setup state (for 2D drawing in perspective mode)
-    inline float currentScreenFov = 45.0f;
-    inline float currentViewW = 0.0f;
-    inline float currentViewH = 0.0f;
-    inline float currentCameraDist = 0.0f;  // Distance from camera to Z=0 plane
-
-    // View/Projection matrix tracking (for worldToScreen/screenToWorld)
-    inline Mat4 currentViewMatrix = Mat4::identity();
-    inline Mat4 currentProjectionMatrix = Mat4::identity();
+    // Screen setup / view-projection tracking state (currentScreenFov,
+    // currentViewW/H, currentCameraDist, currentView/ProjectionMatrix) and the
+    // current 2D blend mode moved to WindowContext (tc/app/tcWindowContext.h).
 
     // Forward declaration of setupScreenFov functions (defined later, after TAU is available)
-    inline void setupScreenFovWithSize(float fovDeg, float viewW, float viewH, float nearDist = 0.0f, float farDist = 0.0f);
+    // `pickable` flows into the registered CameraContext (false for FBO scopes).
+    inline void setupScreenFovWithSize(float fovDeg, float viewW, float viewH, float nearDist = 0.0f, float farDist = 0.0f, bool pickable = true);
     inline void setupScreenFov(float fovDeg, float nearDist = 0.0f, float farDist = 0.0f);
-
-
-    // Blend mode pipelines
-    inline sgl_pipeline blendPipelines[6] = {};
-    inline bool blendPipelinesInitialized = false;
-    inline BlendMode currentBlendMode = BlendMode::Alpha;
-
-    // Premultiplied alpha blend pipeline (for FBO texture compositing)
-    inline sgl_pipeline premultipliedBlendPipeline = {};
-    inline bool premultipliedBlendPipelineInitialized = false;
 }
 
 } // namespace trussc (temporarily closed)
 
-// Forward declarations for FBO pipeline switching (used in tcRenderContext.h)
-namespace trussc { namespace internal {
-    inline bool inFboPass = false;
-    inline sgl_pipeline currentFboBlendPipeline = {};
+// RenderTarget: single source of truth for sgl pipeline selection (swapchain/FBO).
+#include "tc/graphics/tcRenderTarget.h"
 
-    // Restore current blend pipeline after temporary pipeline changes
-    // Handles both FBO and main context
-    inline void restoreCurrentPipeline() {
-        if (inFboPass && currentFboBlendPipeline.id != 0) {
-            sgl_load_pipeline(currentFboBlendPipeline);
-        } else if (blendPipelinesInitialized) {
-            sgl_load_pipeline(blendPipelines[static_cast<int>(currentBlendMode)]);
-        }
-    }
-}}
+// Fixed-step / frame-skip decisions shared by the loops (used by
+// tcWindowContext.h's throttle, _frame_cb and runHeadlessApp).
+#include "tc/app/tcFrameTiming.h"
+
+// Per-window state container (input/hover/camera/pass state) + the active*()
+// pipeline helpers and restoreCurrentPipeline() (used in tcRenderContext.h).
+#include "tc/app/tcWindowContext.h"
 
 // VertexWriter abstraction (for shader integration)
 #include "tc/graphics/tcVertexWriter.h"
@@ -199,13 +228,17 @@ namespace trussc { namespace internal {
 // RenderContext class (holds drawing state)
 #include "tc/graphics/tcRenderContext.h"
 
+// Global mouse state + window-space getters (mouseX/Y, getGlobalMouseX, ...)
+#include "tc/app/tcMouseGlobal.h"
+
+// Transform / matrix / style stack free functions (delegate to RenderContext).
+// Extracted so lower-level headers (e.g. tcNode.h) can depend on them directly.
+#include "tc/graphics/tcTransform.h"
+
 // Reopen namespace
 namespace trussc {
 
-// Version information
-constexpr int VERSION_MAJOR = 0;
-constexpr int VERSION_MINOR = 0;
-constexpr int VERSION_PATCH = 1;
+// Version: git-tag derived — tc::getVersion() in tc/utils/tcVersion.h
 
 // Math constants defined in tcMath.h: TAU, HALF_TAU, QUARTER_TAU, PI
 
@@ -214,23 +247,31 @@ constexpr int VERSION_PATCH = 1;
 // Drawing state has been moved to RenderContext
 // ---------------------------------------------------------------------------
 namespace internal {
-    // Clipboard buffer size (for overflow check)
-    inline int clipboardSize = 65536;
+    // clipboardSize / ScissorRect / scissorStack / currentScissor moved to
+    // WindowContext (tc/app/tcWindowContext.h).
 
-    // sokol_gl vertex buffer management (auto-grows on overflow)
-    inline int sglMaxVertices = 65536;
-    inline int sglMaxCommands = 16384;
-    inline int sglPendingResize = 0;  // non-zero = need resize next frame
-
-    // ---------------------------------------------------------------------------
-    // Scissor Clipping stack
-    // ---------------------------------------------------------------------------
-    struct ScissorRect {
-        float x, y, w, h;
-        bool active;  // Whether a valid range exists in the stack
+    // sokol_gl vertex buffer management (auto-grows on overflow). Defined in
+    // tcGlobal.cpp: the host grows it, and an Fbo created by app code sizes its
+    // sokol_gl context from it.
+    struct SglBudget {
+        int maxVertices = 65536;
+        int maxCommands = 16384;
+        int pendingResize = 0;  // non-zero = need resize next frame
     };
-    inline std::vector<ScissorRect> scissorStack;
-    inline ScissorRect currentScissor = {0, 0, 0, 0, false};
+    SglBudget& sglBudget();
+
+    // Separate report gates for screen and FBO contexts, shared across modules.
+    OnceGate& sglStackErrorReportGate(bool inFbo);
+    void reportSglStackErrors(sgl_error_t err, bool inFbo);
+
+    // Per-frame uniform buffer reservation passed to sg_setup (Metal/WebGPU/Vulkan
+    // ring buffer; GL/D3D11 ignore it). 0 = default: 1MB on Metal (auto-grows on
+    // overflow — TrussC patch in sokol_gfx.h), 4MB sokol default on WebGPU/Vulkan
+    // (no auto-grow there, so set this via WindowSettings::reserveUniformBuffer
+    // for scenes with very high draw-call counts).
+    // Host-only, so a per-module copy is fine (tools/header_state_allowlist.txt):
+    // the launcher sets it and setup() (tcGlobal.cpp) reads it.
+    inline int gpuUniformBufferReserve = 0;
 
     // ---------------------------------------------------------------------------
     // Loop Architecture (Decoupled Update/Draw)
@@ -240,87 +281,70 @@ namespace internal {
     constexpr float VSYNC = -1.0f;        // Sync to monitor refresh rate
     constexpr float EVENT_DRIVEN = 0.0f;  // Only on redraw() call
 
-    // FPS settings
-    inline float updateTargetFps = VSYNC; // VSYNC, EVENT_DRIVEN, or fixed fps
-    inline float drawTargetFps = VSYNC;   // VSYNC, EVENT_DRIVEN, or fixed fps
-    inline bool updateSyncedToDraw = true; // true = update/draw in sync (1:1)
-    inline int redrawCount = 1;            // redraw() counter (remaining draw count)
+    // Main loop state: driven by the frame loop (_frame_cb, in the host),
+    // steered by setFps() / setIndependentFps() / redraw() from app code.
+    // Defined in tcGlobal.cpp so both reach the same instance.
+    struct MainLoopState {
+        // FPS settings
+        float updateTargetFps = VSYNC;   // VSYNC, EVENT_DRIVEN, or fixed fps
+        float drawTargetFps = VSYNC;     // VSYNC, EVENT_DRIVEN, or fixed fps
+        bool updateSyncedToDraw = true;  // true = update/draw in sync (1:1)
+        int redrawCount = 1;             // redraw() counter (remaining draw count)
 
-    // Update timing
-    inline std::chrono::high_resolution_clock::time_point lastUpdateTime;
-    inline bool lastUpdateTimeInitialized = false;
-    inline double updateAccumulator = 0.0; // Accumulated time for independent Update
+        // Update timing (steady clock: a wall-clock step must not skew the loop)
+        std::chrono::steady_clock::time_point lastUpdateTime;
+        bool lastUpdateTimeInitialized = false;
+        double updateAccumulator = 0.0;  // Accumulated time for independent Update
 
-    // Draw timing (frame skip)
-    inline std::chrono::high_resolution_clock::time_point lastDrawTime;
-    inline bool lastDrawTimeInitialized = false;
-    inline double drawAccumulator = 0.0;
+        // Draw timing (frame skip)
+        std::chrono::steady_clock::time_point lastDrawTime;
+        bool lastDrawTimeInitialized = false;
+        double drawAccumulator = 0.0;
+    };
+    MainLoopState& mainLoop();
 
-    // Mouse state
-    inline float mouseX = 0.0f;
-    inline float mouseY = 0.0f;
-    inline float pmouseX = 0.0f;  // Previous frame mouse position
-    inline float pmouseY = 0.0f;
-    inline int mouseButton = -1;  // Currently pressed button (-1 = none)
-    inline bool mousePressed = false;
+    // Mouse position/button state + keyboard state moved to WindowContext
+    // (tc/app/tcWindowContext.h); window-space getters in tc/app/tcMouseGlobal.h.
 
     // Touch-as-mouse mapping
-    // Mobile (Android/iOS): default ON — existing mouse-based code works on touch screens.
-    // Desktop/Web: default OFF — touch and mouse are separate.
-    // Override with setTouchAsMouse(true/false) in setup().
-#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
-    inline bool touchAsMouse = true;
-#else
-    inline bool touchAsMouse = false;
-#endif
+    // Default ON everywhere — the first touch synthesizes mouse press/drag, so
+    // mouse-based code (incl. the web build on iPad/phones) just works. Apps that
+    // want raw touch separate from mouse call setTouchAsMouse(false) in setup().
+    // Defined in tcGlobal.cpp: app code sets it, the host's event callback reads it.
+    bool& touchAsMouse();
 
-    // Touch event listeners (must persist to keep subscriptions alive)
+    // Touch event listeners (must persist to keep subscriptions alive).
+    // Host-only, so a per-module copy is fine: installed by the launcher.
     inline EventListener touchPressedListener;
     inline EventListener touchMovedListener;
     inline EventListener touchReleasedListener;
 
-    // Keyboard state
-    inline std::unordered_set<int> keysPressed;
+    // Delta time / frame-rate state lives in WindowContext (per window).
 
-    // Delta time (actual elapsed time since last update call)
-    inline double updateDeltaTime = 0.0;
-    inline std::chrono::high_resolution_clock::time_point lastUpdateCallTime;
-    inline bool lastUpdateCallTimeInitialized = false;
-
-    // Frame rate measurement (10-frame moving average)
-    inline double frameTimeBuffer[10] = {};
-    inline int frameTimeIndex = 0;
-    inline bool frameTimeBufferFilled = false;
-
-    // Frame count (number of update calls)
+    // Frame count (number of update calls). Host-only, so a per-module copy is
+    // fine: advanced by the launcher's update callback, read through the
+    // non-inline getFrameCount() / getUpdateCount() (tcGlobal.cpp).
     inline uint64_t updateFrameCount = 0;
 
-    // Elapsed time measurement
-    inline std::chrono::high_resolution_clock::time_point startTime;
-    inline bool startTimeInitialized = false;
+    // Elapsed time: one steady clock with its origin at program start, in
+    // tcGlobal.cpp (see tcTime.h).
 
-    // Pass state (for suspending swapchain pass for FBO)
-    inline bool inSwapchainPass = false;
+    // Pass state (inSwapchainPass / swapchainClearValue / lastSwapchainDrawable /
+    // inFboPass) moved to WindowContext (tc/app/tcWindowContext.h).
 
-    // Saved clear color for resume after FBO suspend (set by clear())
-    inline sg_color swapchainClearValue = { 0.0f, 0.0f, 0.0f, 1.0f };
+    // FBO-pass state (fboClearColorFunc / currentFbo / currentFboColorFormat /
+    // currentFboSampleCount) moved to WindowContext (tc/app/tcWindowContext.h),
+    // next to inFboPass — they are per-window pipeline-format selectors.
 
-    // inFboPass and currentFboBlendPipeline are declared earlier (before tcRenderContext.h)
-
-    // Current active FBO pipeline (used from clear())
-    inline sgl_pipeline currentFboClearPipeline = {};
-
-    // FBO clearColor function pointer (set in tcFbo.h)
-    inline void (*fboClearColorFunc)(float, float, float, float) = nullptr;
-
-    // Current active FBO pointer (used from clearColor)
-    inline void* currentFbo = nullptr;
-
-    // Color pixel format of the current FBO pass (for PBR pipeline format matching)
-    inline sg_pixel_format currentFboColorFormat = SG_PIXELFORMAT_RGBA8;
-
-    // MSAAサンプルカウント（FBOパス中のPBRパイプライン用）
-    inline int currentFboSampleCount = 1;
+    // Per-window routing for the context-aware global window-control functions
+    // (setWindowTitle / setWindowSize). Defined in tc/app/tcWindow.h once Window
+    // is complete; forward-declared here because those globals appear earlier in
+    // this header. Return true if a secondary window consumed the call.
+    bool routeSetWindowTitleToWindow(const std::string& title);
+    bool routeSetWindowSizeToWindow(int width, int height);
+    bool routeSetFullscreenToWindow(bool full);
+    bool routeToggleFullscreenToWindow();
+    bool routeIsFullscreenFromWindow(bool& out);
 }
 
 // ---------------------------------------------------------------------------
@@ -340,21 +364,25 @@ void cleanup();
 // ---------------------------------------------------------------------------
 
 // Get DPI scale (e.g., 2.0 for Retina displays)
+// Routed through the active window context (secondary windows keep their own).
 inline float getDpiScale() {
-    return sapp_dpi_scale();
+    auto& ctx = internal::currentWindowContext();
+    return ctx.isMain ? sapp_dpi_scale() : ctx.dpiScale;
 }
 
 // Get actual framebuffer size (in pixels)
 inline int getFramebufferWidth() {
-    return sapp_width();
+    auto& ctx = internal::currentWindowContext();
+    return ctx.isMain ? sapp_width() : ctx.fbWidth;
 }
 
 inline int getFramebufferHeight() {
-    return sapp_height();
+    auto& ctx = internal::currentWindowContext();
+    return ctx.isMain ? sapp_height() : ctx.fbHeight;
 }
 
 // Call at frame start (before clear)
-// Sets up the default projection based on internal::defaultScreenFov
+// Sets up the default projection based on internal::defaultScreenFov()
 namespace internal {
     // Forward declaration (implemented in tcGlobal.cpp)
     void resizeSgl(int newMaxVertices, int newMaxCommands);
@@ -365,12 +393,13 @@ inline void beginFrame() {
     if (headless::isActive()) return;
 
     // Auto-resize sokol_gl buffers if overflow was detected last frame
-    if (internal::sglPendingResize > 0) {
-        internal::resizeSgl(internal::sglPendingResize, std::max(16384, internal::sglPendingResize / 4));
+    const int pendingResize = internal::sglBudget().pendingResize;
+    if (pendingResize > 0) {
+        internal::resizeSgl(pendingResize, std::max(16384, pendingResize / 4));
     }
 
     // Setup screen with default FOV (60 = perspective, 0 = ortho)
-    internal::setupScreenFov(internal::defaultScreenFov);
+    internal::setupScreenFov(internal::defaultScreenFov());
 }
 
 // Clear screen (RGB float: 0.0 ~ 1.0)
@@ -394,7 +423,7 @@ inline void clear(const Color& c) {
 }
 
 // Forward declaration (implemented in tcShader.h after Shader class)
-void flushDeferredShaderDraws();
+namespace internal { void flushDeferredShaderDraws(); }
 
 // パス管理関数（non-inline: Hot Reload時にHost/Guest間で同じグローバル状態を参照するため）
 // 実装は tc/app/tcGlobal.cpp
@@ -489,6 +518,24 @@ inline StrokeJoin getStrokeJoin() {
     return getDefaultContext().getStrokeJoin();
 }
 
+// Point drawing state (size in logical pixels, like strokeWeight). Drives the
+// GPU splat path of a Mesh drawn in PrimitiveMode::Points.
+inline void setPointSize(float px) {
+    getDefaultContext().setPointSize(px);
+}
+
+inline float getPointSize() {
+    return getDefaultContext().getPointSize();
+}
+
+inline void setPointStyle(PointStyle s) {
+    getDefaultContext().setPointStyle(s);
+}
+
+inline PointStyle getPointStyle() {
+    return getDefaultContext().getPointStyle();
+}
+
 // ---------------------------------------------------------------------------
 // Scissor Clipping (drawing region restriction)
 // ---------------------------------------------------------------------------
@@ -509,7 +556,7 @@ inline void intersectRect(float x1, float y1, float w1, float h1,
 
 // Set scissor rectangle (screen coordinates)
 inline void setScissor(float x, float y, float w, float h) {
-    internal::currentScissor = {x, y, w, h, true};
+    internal::currentWindowContext().currentScissor = {x, y, w, h, true};
     sgl_scissor_rectf(x, y, w, h, true);  // origin_top_left = true
 }
 
@@ -520,20 +567,20 @@ inline void setScissor(int x, int y, int w, int h) {
 
 // Reset scissor to entire window
 inline void resetScissor() {
-    internal::currentScissor.active = false;
-    sgl_scissor_rect(0, 0, sapp_width(), sapp_height(), true);
+    internal::currentWindowContext().currentScissor.active = false;
+    sgl_scissor_rect(0, 0, getFramebufferWidth(), getFramebufferHeight(), true);
 }
 
 // Save scissor to stack and set new range (intersection with current range)
 inline void pushScissor(float x, float y, float w, float h) {
     // Save current state to stack
-    internal::scissorStack.push_back(internal::currentScissor);
+    internal::currentWindowContext().scissorStack.push_back(internal::currentWindowContext().currentScissor);
 
     // Calculate new range (intersection with current range)
-    if (internal::currentScissor.active) {
+    if (internal::currentWindowContext().currentScissor.active) {
         float nx, ny, nw, nh;
-        intersectRect(internal::currentScissor.x, internal::currentScissor.y,
-                      internal::currentScissor.w, internal::currentScissor.h,
+        intersectRect(internal::currentWindowContext().currentScissor.x, internal::currentWindowContext().currentScissor.y,
+                      internal::currentWindowContext().currentScissor.w, internal::currentWindowContext().currentScissor.h,
                       x, y, w, h,
                       nx, ny, nw, nh);
         setScissor(nx, ny, nw, nh);
@@ -544,156 +591,24 @@ inline void pushScissor(float x, float y, float w, float h) {
 
 // Restore scissor from stack
 inline void popScissor() {
-    if (internal::scissorStack.empty()) {
+    if (internal::currentWindowContext().scissorStack.empty()) {
         resetScissor();
         return;
     }
 
-    internal::currentScissor = internal::scissorStack.back();
-    internal::scissorStack.pop_back();
+    internal::currentWindowContext().currentScissor = internal::currentWindowContext().scissorStack.back();
+    internal::currentWindowContext().scissorStack.pop_back();
 
-    if (internal::currentScissor.active) {
-        sgl_scissor_rectf(internal::currentScissor.x, internal::currentScissor.y,
-                          internal::currentScissor.w, internal::currentScissor.h, true);
+    if (internal::currentWindowContext().currentScissor.active) {
+        sgl_scissor_rectf(internal::currentWindowContext().currentScissor.x, internal::currentWindowContext().currentScissor.y,
+                          internal::currentWindowContext().currentScissor.w, internal::currentWindowContext().currentScissor.h, true);
     } else {
-        sgl_scissor_rect(0, 0, sapp_width(), sapp_height(), true);
+        sgl_scissor_rect(0, 0, getFramebufferWidth(), getFramebufferHeight(), true);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Transformations (delegated to RenderContext)
-// ---------------------------------------------------------------------------
-
-// Save matrix to stack
-inline void pushMatrix() {
-    getDefaultContext().pushMatrix();
-}
-
-// Restore matrix from stack
-inline void popMatrix() {
-    getDefaultContext().popMatrix();
-}
-
-// Save style to stack (color, fill/stroke, textAlign, etc.)
-inline void pushStyle() {
-    getDefaultContext().pushStyle();
-}
-
-// Restore style from stack
-inline void popStyle() {
-    getDefaultContext().popStyle();
-}
-
-// Reset style to default values (white color, fill enabled, etc.)
-inline void resetStyle() {
-    getDefaultContext().resetStyle();
-}
-
-// Translation
-inline void translate(Vec3 pos) {
-    getDefaultContext().translate(pos);
-}
-
-inline void translate(float x, float y, float z) {
-    getDefaultContext().translate(x, y, z);
-}
-
-inline void translate(float x, float y) {
-    getDefaultContext().translate(x, y);
-}
-
-// Z-axis rotation (radians)
-inline void rotate(float radians) {
-    getDefaultContext().rotate(radians);
-}
-
-// X-axis rotation (radians)
-inline void rotateX(float radians) {
-    getDefaultContext().rotateX(radians);
-}
-
-// Y-axis rotation (radians)
-inline void rotateY(float radians) {
-    getDefaultContext().rotateY(radians);
-}
-
-// Z-axis rotation (radians) - explicit
-inline void rotateZ(float radians) {
-    getDefaultContext().rotateZ(radians);
-}
-
-// Rotation in degrees
-inline void rotateDeg(float degrees) {
-    getDefaultContext().rotateDeg(degrees);
-}
-
-inline void rotateXDeg(float degrees) {
-    getDefaultContext().rotateXDeg(degrees);
-}
-
-inline void rotateYDeg(float degrees) {
-    getDefaultContext().rotateYDeg(degrees);
-}
-
-inline void rotateZDeg(float degrees) {
-    getDefaultContext().rotateZDeg(degrees);
-}
-
-// Euler rotation (x, y, z in radians)
-inline void rotate(float x, float y, float z) {
-    rotateX(x);
-    rotateY(y);
-    rotateZ(z);
-}
-
-inline void rotate(const Vec3& euler) {
-    rotate(euler.x, euler.y, euler.z);
-}
-
-inline void rotate(const Quaternion& quat) {
-    getDefaultContext().rotate(quat);
-}
-
-// Euler rotation in degrees
-inline void rotateDeg(float x, float y, float z) {
-    rotateXDeg(x);
-    rotateYDeg(y);
-    rotateZDeg(z);
-}
-
-inline void rotateDeg(const Vec3& euler) {
-    rotateDeg(euler.x, euler.y, euler.z);
-}
-
-// Scale (uniform)
-inline void scale(float s) {
-    getDefaultContext().scale(s);
-}
-
-// Scale (non-uniform 2D)
-inline void scale(float sx, float sy) {
-    getDefaultContext().scale(sx, sy);
-}
-
-// Scale (non-uniform 3D)
-inline void scale(float sx, float sy, float sz) {
-    getDefaultContext().scale(sx, sy, sz);
-}
-
-// Get current transformation matrix
-inline Mat4 getCurrentMatrix() {
-    return getDefaultContext().getCurrentMatrix();
-}
-
-// Reset transformation matrix
-inline void resetMatrix() {
-    getDefaultContext().resetMatrix();
-}
-
-// Set transformation matrix directly
-inline void setMatrix(const Mat4& mat) {
-    getDefaultContext().setMatrix(mat);
-}
+// Transform / matrix / style stack free functions are now in tc/graphics/
+// tcTransform.h (included at file scope above, before namespace trussc opens).
 
 // ---------------------------------------------------------------------------
 // Blend mode
@@ -701,17 +616,18 @@ inline void setMatrix(const Mat4& mat) {
 
 // Set blend mode
 // Alpha channel is additive in all modes (to prevent transparency when drawing to FBO)
+// Works on the swapchain AND inside an Fbo pass: active2D() resolves the
+// pipeline against the current render target, so each target lazily gets a
+// pipeline matching its own color format / sample count.
 inline void setBlendMode(BlendMode mode) {
-    if (!internal::blendPipelinesInitialized) return;
-    // Skip in FBO - FBO uses its own pipeline
-    if (internal::inFboPass) return;
-    internal::currentBlendMode = mode;
-    sgl_load_pipeline(internal::blendPipelines[static_cast<int>(mode)]);
+    if (internal::currentWindowContext().swapchainTarget.context.id == 0) return;  // renderer not set up yet
+    internal::currentWindowContext().currentBlendMode = mode;
+    internal::loadPipeline(internal::active2D(mode));
 }
 
 // Get current blend mode
 inline BlendMode getBlendMode() {
-    return internal::currentBlendMode;
+    return internal::currentWindowContext().currentBlendMode;
 }
 
 // Reset to default blend mode (Alpha)
@@ -721,9 +637,41 @@ inline void resetBlendMode() {
 
 // Restore current blend mode pipeline (use after temporary pipeline changes)
 inline void restoreBlendPipeline() {
-    if (internal::blendPipelinesInitialized) {
-        sgl_load_pipeline(internal::blendPipelines[static_cast<int>(internal::currentBlendMode)]);
-    }
+    internal::restoreCurrentPipeline();
+}
+
+// ---------------------------------------------------------------------------
+// Depth test (for 2D blend pipelines)
+// ---------------------------------------------------------------------------
+// Every setBlendMode() pipeline normally has depth write/test OFF; only the 3D
+// pipeline (loaded by screen setup / EasyCam::begin()) writes depth. Changing
+// the blend mode mid-scene therefore drops depth testing for everything after
+// it. enableDepthTest() restores depth (compare LESS_EQUAL + depth write, same
+// config as the 3D pipeline) for the CURRENT blend mode and every subsequent
+// setBlendMode() / textured draw, until disableDepthTest().
+//
+// Like the blend mode, the flag persists until changed: across frames and into
+// Fbo passes alike (active2D() resolves per render target). Screen setup and
+// EasyCam::begin() keep loading the always-depth-tested 3D pipeline regardless
+// of this flag — it exists to restore depth AFTER a blend-mode change.
+
+// Enable depth test/write on the current (and future) blend pipelines
+inline void enableDepthTest() {
+    if (internal::currentWindowContext().swapchainTarget.context.id == 0) return;  // renderer not set up yet
+    internal::currentWindowContext().depthTestEnabled = true;
+    internal::restoreCurrentPipeline();
+}
+
+// Disable depth test/write on the current (and future) blend pipelines (default)
+inline void disableDepthTest() {
+    if (internal::currentWindowContext().swapchainTarget.context.id == 0) return;  // renderer not set up yet
+    internal::currentWindowContext().depthTestEnabled = false;
+    internal::restoreCurrentPipeline();
+}
+
+// Whether the depth-tested blend pipeline variant is active (see enableDepthTest)
+inline bool isDepthTestEnabled() {
+    return internal::currentWindowContext().depthTestEnabled;
 }
 
 // ---------------------------------------------------------------------------
@@ -734,26 +682,21 @@ inline void restoreBlendPipeline() {
 // Deprecated: 3D is now enabled by default with setupScreenFov
 [[deprecated("3D is now enabled by default. Use setupScreenPerspective() to change FOV.")]]
 inline void enable3D() {
-    if (internal::pipeline3dInitialized) {
-        sgl_load_pipeline(internal::pipeline3d);
-    }
+    internal::loadPipeline(internal::active3D());   // format-correct 3D for the active target
 }
 
 // Enable 3D drawing mode (perspective)
 // Deprecated: use setupScreenPerspective() or setupScreenFov() instead
 [[deprecated("Use setupScreenPerspective(fovDeg) or setupScreenFov(fovDeg) instead. Note: FOV is now in degrees, not radians.")]]
 inline void enable3DPerspective(float fovY = 0.785f, float nearZ = 0.1f, float farZ = 1000.0f) {
-    if (internal::pipeline3dInitialized) {
-        sgl_load_pipeline(internal::pipeline3d);
-    }
-    // Set perspective projection
-    sgl_matrix_mode_projection();
-    sgl_load_identity();
-    float dpiScale = sapp_dpi_scale();
-    float w = (float)sapp_width() / dpiScale;
-    float h = (float)sapp_height() / dpiScale;
+    internal::loadPipeline(internal::active3D());   // format-correct 3D for the active target
+    // Set perspective projection (backend-native clip-z, #134). Per-window
+    // framebuffer size / dpi so this is correct inside a secondary window's draw.
+    float dpiScale = getDpiScale();
+    float w = (float)getFramebufferWidth() / dpiScale;
+    float h = (float)getFramebufferHeight() / dpiScale;
     float aspect = w / h;
-    sgl_perspective(fovY, aspect, nearZ, farZ);
+    internal::sglLoadProjection(internal::toBackendClip(Mat4::perspective(fovY, aspect, nearZ, farZ)));
     sgl_matrix_mode_modelview();
     sgl_load_identity();
 }
@@ -765,7 +708,7 @@ namespace internal {
     constexpr float minFovForCalc = 10.0f;
 
     // Core implementation with explicit width/height (for FBO support)
-    inline void setupScreenFovWithSize(float fovDeg, float viewW, float viewH, float nearDist, float farDist) {
+    inline void setupScreenFovWithSize(float fovDeg, float viewW, float viewH, float nearDist, float farDist, bool pickable) {
         // Skip in headless mode
         if (headless::isActive()) return;
 
@@ -776,14 +719,16 @@ namespace internal {
         float dist = viewH / (2.0f * theTan);
 
         // Save current screen state for 2D drawing
-        currentScreenFov = fovDeg;
-        currentViewW = viewW;
-        currentViewH = viewH;
-        currentCameraDist = dist;
+        internal::currentWindowContext().currentScreenFov = fovDeg;
+        internal::currentWindowContext().currentViewW = viewW;
+        internal::currentWindowContext().currentViewH = viewH;
+        internal::currentWindowContext().currentCameraDist = dist;
 
         // Apply clip overrides or auto-calculate
-        if (nearDist == 0.0f) nearDist = (nearClipOverride > 0.0f) ? nearClipOverride : dist / 10.0f;
-        if (farDist == 0.0f) farDist = (farClipOverride > 0.0f) ? farClipOverride : dist * 10.0f;
+        const float nearOverride = nearClipOverride();
+        const float farOverride = farClipOverride();
+        if (nearDist == 0.0f) nearDist = (nearOverride > 0.0f) ? nearOverride : dist / 10.0f;
+        if (farDist == 0.0f) farDist = (farOverride > 0.0f) ? farOverride : dist * 10.0f;
 
         float eyeX = viewW / 2.0f;
         float eyeY = viewH / 2.0f;
@@ -791,12 +736,18 @@ namespace internal {
         if (fovDeg <= 0.0f) {
             // Orthographic projection (2D mode)
             sgl_defaults();
-            // Load alpha blend pipeline for 2D (skip in FBO - FBO loads its own pipeline)
-            if (blendPipelinesInitialized && !inFboPass) {
-                sgl_load_pipeline(blendPipelines[static_cast<int>(BlendMode::Alpha)]);
-            }
-            sgl_matrix_mode_projection();
-            sgl_ortho(0.0f, viewW, viewH, 0.0f, -farDist, farDist);
+            // 2D alpha pipeline for the active target (swapchain or FBO).
+            loadPipeline(activeFill2D());
+            // Ortho volume CENTERED on the camera: the lookat below moves the
+            // world center to the view origin, so the volume must span
+            // [-W/2, W/2] x [H/2, -H/2] (Y flipped) — a [0, W] x [H, 0] volume
+            // here double-offsets everything by half a screen.
+            // Built as a Mat4 and remapped to the backend's clip-z convention
+            // (#134); the SAME matrix is stored and fed to sgl so the sgl and
+            // mesh (PBR/points) pipelines agree on depth.
+            Mat4 proj = internal::toBackendClip(
+                Mat4::ortho(-viewW / 2.0f, viewW / 2.0f, viewH / 2.0f, -viewH / 2.0f, -farDist, farDist));
+            internal::sglLoadProjection(proj);
             sgl_matrix_mode_modelview();
             sgl_load_identity();
             // Camera position (for consistent Z behavior with perspective)
@@ -807,31 +758,29 @@ namespace internal {
             );
 
             // Save matrices for worldToScreen/screenToWorld
-            currentProjectionMatrix = Mat4::ortho(0.0f, viewW, viewH, 0.0f, -farDist, farDist);
-            currentViewMatrix = Mat4::lookAt(
+            internal::currentWindowContext().currentProjectionMatrix = proj;
+            internal::currentWindowContext().currentViewMatrix = Mat4::lookAt(
                 Vec3(eyeX, eyeY, dist),
                 Vec3(eyeX, eyeY, 0.0f),
                 Vec3(0.0f, 1.0f, 0.0f)
             );
         } else {
-            // Perspective projection (3D mode)
-            // Skip pipeline loading in FBO - FBO loads its own pipeline
-            if (pipeline3dInitialized && !inFboPass) {
-                sgl_load_pipeline(pipeline3d);
-            }
+            // Perspective projection (3D mode) — format-correct 3D for the active target.
+            loadPipeline(active3D());
 
             float aspect = viewW / viewH;
 
             // Set perspective projection with Y-flip for screen coordinates (Y down)
-            sgl_matrix_mode_projection();
-            sgl_load_identity();
             float fovRad = fovDeg * TAU / 360.0f;
             float top = nearDist * tanf(fovRad * 0.5f);
             float bottom = -top;
             float right = top * aspect;
             float left = -right;
-            // Swap top/bottom to flip Y axis (screen coords: Y increases downward)
-            sgl_frustum(left, right, top, bottom, nearDist, farDist);
+            // Swap top/bottom to flip Y axis (screen coords: Y increases
+            // downward). Backend-native clip-z, same reasoning as ortho above.
+            Mat4 proj = internal::toBackendClip(
+                Mat4::frustum(left, right, top, bottom, nearDist, farDist));
+            internal::sglLoadProjection(proj);
 
             // Set view matrix (camera at viewport center, looking at Z=0)
             sgl_matrix_mode_modelview();
@@ -843,20 +792,27 @@ namespace internal {
             );
 
             // Save matrices for worldToScreen/screenToWorld
-            currentProjectionMatrix = Mat4::frustum(left, right, top, bottom, nearDist, farDist);
-            currentViewMatrix = Mat4::lookAt(
+            internal::currentWindowContext().currentProjectionMatrix = proj;
+            internal::currentWindowContext().currentViewMatrix = Mat4::lookAt(
                 Vec3(eyeX, eyeY, dist),
                 Vec3(eyeX, eyeY, 0.0f),
                 Vec3(0.0f, 1.0f, 0.0f)
             );
         }
+
+        // Register this camera scope so nodes drawn from here on stamp it
+        // (draw-time stamping → per-context pick rays; see tcCameraContext.h).
+        registerCameraContext(internal::currentWindowContext().currentViewMatrix, internal::currentWindowContext().currentProjectionMatrix, viewW, viewH, pickable);
     }
 
     // Wrapper that uses main screen size
     inline void setupScreenFov(float fovDeg, float nearDist, float farDist) {
-        float dpiScale = sapp_dpi_scale();
-        float viewW = pixelPerfectMode ? (float)sapp_width() : (float)sapp_width() / dpiScale;
-        float viewH = pixelPerfectMode ? (float)sapp_height() : (float)sapp_height() / dpiScale;
+        // Per-window: framebuffer size and dpi come from the ACTIVE window
+        // context (a secondary window on another display has its own scale).
+        float dpiScale = getDpiScale();
+        const bool pixelPerfect = pixelPerfectMode();
+        float viewW = pixelPerfect ? (float)getFramebufferWidth() : getFramebufferWidth() / dpiScale;
+        float viewH = pixelPerfect ? (float)getFramebufferHeight() : getFramebufferHeight() / dpiScale;
         setupScreenFovWithSize(fovDeg, viewW, viewH, nearDist, farDist);
     }
 } // namespace internal
@@ -882,28 +838,28 @@ inline void setupScreenOrtho() {
 // Set/get default screen FOV (called automatically at frame start and FBO begin)
 // 0 = ortho (2D), 45 = default perspective (~28mm equivalent)
 inline void setDefaultScreenFov(float fovDeg) {
-    internal::defaultScreenFov = fovDeg;
+    internal::defaultScreenFov() = fovDeg;
 }
 
 inline float getDefaultScreenFov() {
-    return internal::defaultScreenFov;
+    return internal::defaultScreenFov();
 }
 
 // Set/get near/far clip planes (0 = auto-calculate based on camera distance)
 inline void setNearClip(float nearDist) {
-    internal::nearClipOverride = nearDist;
+    internal::nearClipOverride() = nearDist;
 }
 
 inline void setFarClip(float farDist) {
-    internal::farClipOverride = farDist;
+    internal::farClipOverride() = farDist;
 }
 
 inline float getNearClip() {
-    return internal::nearClipOverride;
+    return internal::nearClipOverride();
 }
 
 inline float getFarClip() {
-    return internal::farClipOverride;
+    return internal::farClipOverride();
 }
 
 // ---------------------------------------------------------------------------
@@ -914,13 +870,14 @@ inline float getFarClip() {
 /// Returns Vec3: x, y = screen position (pixels from top-left), z = normalized depth [0, 1]
 inline Vec3 worldToScreen(const Vec3& worldPos) {
     // Get current viewport dimensions
-    float viewW = internal::currentViewW;
-    float viewH = internal::currentViewH;
-    if (viewW == 0) viewW = (float)sapp_width() / sapp_dpi_scale();
-    if (viewH == 0) viewH = (float)sapp_height() / sapp_dpi_scale();
+    float viewW = internal::currentWindowContext().currentViewW;
+    float viewH = internal::currentWindowContext().currentViewH;
+    // Per-window fallback (secondary windows have their own framebuffer/dpi).
+    if (viewW == 0) viewW = (float)getFramebufferWidth() / getDpiScale();
+    if (viewH == 0) viewH = (float)getFramebufferHeight() / getDpiScale();
 
     // Transform world -> clip space
-    Mat4 mvp = internal::currentProjectionMatrix * internal::currentViewMatrix;
+    Mat4 mvp = internal::currentWindowContext().currentProjectionMatrix * internal::currentWindowContext().currentViewMatrix;
     Vec4 clip = mvp * Vec4(worldPos.x, worldPos.y, worldPos.z, 1.0f);
 
     // Perspective division
@@ -929,11 +886,11 @@ inline Vec3 worldToScreen(const Vec3& worldPos) {
     }
     Vec3 ndc(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
 
-    // NDC [-1, 1] to screen coordinates
+    // NDC to screen coordinates (x, y are [-1, 1] under every convention)
     // Note: NDC Y is up (+1=top), screen Y is down (+Y=bottom), so flip Y
     float screenX = (ndc.x + 1.0f) * 0.5f * viewW;
     float screenY = (1.0f - ndc.y) * 0.5f * viewH;  // Flip Y for screen coordinates
-    float depth = (ndc.z + 1.0f) * 0.5f;  // Normalize depth to [0, 1]
+    float depth = internal::depthFromNdcZ(ndc.z);   // convention-aware [0, 1] depth
 
     return Vec3(screenX, screenY, depth);
 }
@@ -943,23 +900,25 @@ inline Vec3 worldToScreen(const Vec3& worldPos) {
 /// worldZ: target Z plane (default = 0)
 inline Vec3 screenToWorld(const Vec2& screenPos, float worldZ = 0.0f) {
     // Get current viewport dimensions
-    float viewW = internal::currentViewW;
-    float viewH = internal::currentViewH;
-    if (viewW == 0) viewW = (float)sapp_width() / sapp_dpi_scale();
-    if (viewH == 0) viewH = (float)sapp_height() / sapp_dpi_scale();
+    float viewW = internal::currentWindowContext().currentViewW;
+    float viewH = internal::currentWindowContext().currentViewH;
+    // Per-window fallback (secondary windows have their own framebuffer/dpi).
+    if (viewW == 0) viewW = (float)getFramebufferWidth() / getDpiScale();
+    if (viewH == 0) viewH = (float)getFramebufferHeight() / getDpiScale();
 
     // Screen to NDC (flip Y: screen Y is down, NDC Y is up)
     float ndcX = (screenPos.x / viewW) * 2.0f - 1.0f;
     float ndcY = 1.0f - (screenPos.y / viewH) * 2.0f;  // Flip Y
 
     // Create inverse MVP matrix
-    Mat4 mvp = internal::currentProjectionMatrix * internal::currentViewMatrix;
+    Mat4 mvp = internal::currentWindowContext().currentProjectionMatrix * internal::currentWindowContext().currentViewMatrix;
     Mat4 invMvp = mvp.inverted();
 
-    // Unproject two points: near plane (z=-1) and a middle point (z=0)
-    // Using z=0 instead of z=1 (far) to avoid precision issues with large far clip
-    Vec4 nearClip = invMvp * Vec4(ndcX, ndcY, -1.0f, 1.0f);
-    Vec4 midClip = invMvp * Vec4(ndcX, ndcY, 0.0f, 1.0f);
+    // Unproject two points: near plane and a middle point (mid instead of far
+    // to avoid precision issues with large far clip). NDC z values depend on
+    // the backend's clip-space convention.
+    Vec4 nearClip = invMvp * Vec4(ndcX, ndcY, internal::ndcNearZ(), 1.0f);
+    Vec4 midClip = invMvp * Vec4(ndcX, ndcY, internal::ndcMidZ(), 1.0f);
 
     // Perspective division (use smaller threshold for numerical stability)
     if (std::abs(nearClip.w) < 1e-7f || std::abs(midClip.w) < 1e-7f) {
@@ -1026,6 +985,17 @@ inline void drawRectSquircle(float x, float y, float w, float h, float radius) {
     getDefaultContext().drawRectSquircle(x, y, w, h, radius);
 }
 
+// Superellipse inscribed in the rect (pos, size) — drop-in alternative to
+// drawRectRounded. n morphs the shape (2=ellipse, 4=squircle, higher->rect);
+// default n=5 approximates the Apple app-icon silhouette.
+inline void drawSuperellipse(Vec3 pos, Vec2 size, float n = 5.0f) {
+    getDefaultContext().drawSuperellipse(pos, size, n);
+}
+
+inline void drawSuperellipse(float x, float y, float w, float h, float n = 5.0f) {
+    getDefaultContext().drawSuperellipse(x, y, w, h, n);
+}
+
 // Circle
 inline void drawCircle(Vec3 center, float radius) {
     getDefaultContext().drawCircle(center, radius);
@@ -1046,6 +1016,39 @@ inline void drawEllipse(Vec3 center, float rx, float ry) {
 
 inline void drawEllipse(float cx, float cy, float rx, float ry) {
     getDefaultContext().drawEllipse(cx, cy, rx, ry);
+}
+
+// Arc — see RenderContext::drawArc for semantics. Angles in radians.
+inline void drawArc(Vec3 center, float radius, float angleBegin, float angleEnd) {
+    getDefaultContext().drawArc(center, radius, angleBegin, angleEnd);
+}
+inline void drawArc(float x, float y, float radius, float angleBegin, float angleEnd) {
+    getDefaultContext().drawArc(x, y, radius, angleBegin, angleEnd);
+}
+
+// Bezier — stroke-only. Cubic / quadratic / N-th order via overloading.
+inline void drawBezier(Vec3 p0, Vec3 p1, Vec3 p2, Vec3 p3) {
+    getDefaultContext().drawBezier(p0, p1, p2, p3);
+}
+inline void drawBezier(Vec3 p0, Vec3 p1, Vec3 p2) {
+    getDefaultContext().drawBezier(p0, p1, p2);
+}
+inline void drawBezier(const std::vector<Vec3>& controlPoints) {
+    getDefaultContext().drawBezier(controlPoints);
+}
+
+// Catmull-Rom curve — stroke-only. p1->p2 is the drawn segment, with
+// p0/p3 acting as tangent influences. Same semantics as oF's drawCurve.
+inline void drawCurve(Vec3 p0, Vec3 p1, Vec3 p2, Vec3 p3) {
+    getDefaultContext().drawCurve(p0, p1, p2, p3);
+}
+// Chained Catmull-Rom through N points (open). Requires N >= 4.
+inline void drawCurve(const std::vector<Vec3>& points) {
+    getDefaultContext().drawCurve(points);
+}
+// Chained Catmull-Rom with closed=true for a smooth wraparound loop.
+inline void drawCurve(const std::vector<Vec3>& points, bool closed) {
+    getDefaultContext().drawCurve(points, closed);
 }
 
 // Line
@@ -1079,11 +1082,35 @@ inline void drawPoint(float x, float y) {
     getDefaultContext().drawPoint(x, y);
 }
 
-// Set circle resolution
-inline void setCircleResolution(int res) {
-    getDefaultContext().setCircleResolution(res);
+// -----------------------------------------------------------------------
+// Curve quality — see tcRenderContext.h for the full doc comment.
+// -----------------------------------------------------------------------
+
+inline void setCurveTolerance(float pixels) {
+    getDefaultContext().setCurveTolerance(pixels);
+}
+inline void setCurveResolution(int n) {
+    getDefaultContext().setCurveResolution(n);
+}
+inline float getCurveTolerance() {
+    return getDefaultContext().getCurveTolerance();
+}
+inline int getCurveResolution() {
+    return getDefaultContext().getCurveResolution();
+}
+inline CurveStyle::Mode getCurveMode() {
+    return getDefaultContext().getCurveMode();
 }
 
+// Legacy alias. Forwards to setCurveResolution to avoid double-warning;
+// the deprecation marker fires at the user's call site.
+// Will be removed in v1.0.0
+[[deprecated("Use setCurveResolution(int), or setCurveTolerance(float) for adaptive quality. Will be removed in v1.0.0")]]
+inline void setCircleResolution(int res) {
+    getDefaultContext().setCurveResolution(res);
+}
+
+[[deprecated("Use getCurveResolution() instead. Will be removed in v1.0.0")]]
 inline int getCircleResolution() {
     return getDefaultContext().getCircleResolution();
 }
@@ -1101,27 +1128,148 @@ inline bool isStrokeEnabled() {
 // Bitmap string drawing (delegated to RenderContext)
 // ---------------------------------------------------------------------------
 
-// Calculate text bounding box
+// Calculate text bounding box (UTF-8 + fullwidth aware)
 inline void getBitmapStringBounds(const std::string& text, float& width, float& height) {
     float maxWidth = 0;
     float cursorX = 0;
     int lines = 1;
 
-    for (char c : text) {
-        if (c == '\n') {
-            if (cursorX > maxWidth) maxWidth = cursorX;
-            cursorX = 0;
-            lines++;
-        } else if (c == '\t') {
-            cursorX += bitmapfont::GLYPH_WIDTH * 8;
-        } else {
-            cursorX += bitmapfont::GLYPH_WIDTH;
-        }
+    const char* p  = text.data();
+    const char* pe = p + text.size();
+    while (p < pe) {
+        unsigned char b0 = (unsigned char)*p;
+        if (b0 == '\n') { ++p; if (cursorX > maxWidth) maxWidth = cursorX; cursorX = 0; ++lines; continue; }
+        if (b0 == '\t') { ++p; cursorX += bitmapfont::CHAR_TEX_WIDTH * 8; continue; }
+        if (b0 < 32)    { ++p; continue; }
+        uint32_t cp = bitmapfont::utf8Decode(p, pe);
+        if (cp == 0) break;
+        cursorX += (float)bitmapfont::codepointPixelWidth(cp);
     }
     if (cursorX > maxWidth) maxWidth = cursorX;
 
-    width = maxWidth;
+    width  = maxWidth;
     height = lines * bitmapfont::CHAR_TEX_HEIGHT;
+}
+
+// ---------------------------------------------------------------------------
+// Lazy font atlas allocation
+// ---------------------------------------------------------------------------
+// Ensures the bitmap font atlas exists and is at least `rows` cell-rows tall.
+//
+// Two paths:
+//   - Size grew (tier promotion) or first allocation:
+//     create a fresh sg_image. The old one is destroyed deferred (see
+//     tcGpuDestroyQueue.h) so sokol_gl commands recorded earlier in the
+//     frame keep their handles valid until the end-of-frame flush.
+//   - Same size, contents changed (registerGlyph / updateGlyph):
+//     reuse the image via sg_update_image(). No destroy → no dangling
+//     references in sokol_gl's deferred command queue. This makes per-frame
+//     glyph updates (e.g. animated walker) practical.
+//
+// The image is created with `usage.dynamic_update = true` so sg_update_image
+// is allowed.
+uint64_t getFrameCount();  // forward decl — defined in Time section below
+inline void ensureFontAtlas(int rows) {
+    if (rows <= 0) return;
+    auto& atlas = internal::bitmapFontAtlas();
+    if (!atlas.initialized) return;  // pipeline/sampler not ready yet
+
+    // The atlas texture is fixed-width with a hard row cap (512x512 =
+    // CELLS_PER_COL rows). generateAtlasPixels() clamps its buffer to that
+    // cap, so the row count used for the texture height / upload size below
+    // MUST be clamped identically — otherwise sg_update_image would read
+    // past the end of the CPU pixel buffer (SIGBUS, issue #188). Glyphs
+    // registered beyond capacity degrade gracefully: their cells are skipped
+    // by generateAtlasPixels and they render as blanks.
+    if (rows > bitmapfont::CELLS_PER_COL) {
+        static OnceGate warned;
+        if (warned.isFirstTime()) {
+            logWarning("BitmapFont") << "Glyph atlas is full ("
+                << bitmapfont::CELLS_PER_COL << " rows, "
+                << bitmapfont::TOTAL_CELLS << " cells); glyphs registered "
+                << "beyond capacity will not render.";
+        }
+        rows = bitmapfont::CELLS_PER_COL;
+    }
+    const uint64_t curRegistry = bitmapfont::internal::registryVersion();
+    const bool sizeOk = atlas.atlasInitialized
+                     && atlas.rows >= rows;
+    const bool versionOk = atlas.version == curRegistry;
+    if (sizeOk && versionOk) return;
+    if (!sg_isvalid()) return;
+
+    // Same-frame upload guard. sokol allows at most one sg_update_image per
+    // image per frame (VALIDATE_UPDIMG_ONCE). If we already uploaded this
+    // frame and the atlas size hasn't changed, defer to next frame — the
+    // stale atlas.version makes us try again on the next call.
+    // (When size changes we destroy + create a brand-new image below, so the
+    // guard only applies to the same-dimensions in-place path.)
+    // Keyed on the per-window getFrameCount() (Fix 3): the guard only needs to
+    // block a second update WITHIN one tick, and each window's tick does its
+    // own sg_commit, so a per-window counter is sufficient (a rare coincidental
+    // counter match across windows just defers one tick — never a double
+    // update). The main window is bit-identical to before.
+    if (sizeOk && atlas.uploadFrame == getFrameCount()) return;
+
+    // Regenerate pixel buffer. Use the LARGER of `rows` and the currently
+    // allocated rows so a same-size in-place update stays the same size.
+    int effRows = sizeOk ? atlas.rows : rows;
+    int height  = effRows * bitmapfont::CELL_H;
+    unsigned char* pixels = bitmapfont::generateAtlasPixels(effRows);
+    int dataBytes = bitmapfont::ATLAS_WIDTH * height * 4;
+
+    if (sizeOk) {
+        // Same dimensions — upload via sg_update_image. The image identity
+        // (sg_image handle) and view stay the same, so any queued sokol_gl
+        // commands referencing them keep working.
+        sg_image_data data = {};
+        data.mip_levels[0].ptr  = pixels;
+        data.mip_levels[0].size = dataBytes;
+        sg_update_image(atlas.texture, &data);
+        atlas.uploadFrame = getFrameCount();
+    } else {
+        // Size changed (or first allocation). Recreate the image. The old
+        // image/view are destroyed deferred — sokol_gl commands recorded
+        // earlier this frame still reference them until the end-of-frame
+        // flush (drained in present() after sg_commit).
+        if (atlas.atlasInitialized) {
+            internal::deferGpuDestroy(atlas.view);
+            internal::deferGpuDestroy(atlas.texture);
+            atlas.atlasInitialized = false;
+        }
+
+        sg_image_desc img_desc = {};
+        img_desc.width  = bitmapfont::ATLAS_WIDTH;
+        img_desc.height = height;
+        img_desc.pixel_format = SG_PIXELFORMAT_RGBA8;
+        img_desc.usage.dynamic_update = true;   // enable sg_update_image()
+        // (intentionally no initial data — sg expects an update call instead
+        //  for non-immutable images)
+        atlas.texture = sg_make_image(&img_desc);
+
+        sg_image_data data = {};
+        data.mip_levels[0].ptr  = pixels;
+        data.mip_levels[0].size = dataBytes;
+        sg_update_image(atlas.texture, &data);
+        atlas.uploadFrame = getFrameCount();
+
+        sg_view_desc view_desc = {};
+        view_desc.texture.image = atlas.texture;
+        atlas.view = sg_make_view(&view_desc);
+
+        atlas.rows = effRows;
+        atlas.atlasInitialized = true;
+    }
+
+    delete[] pixels;
+    atlas.version = curRegistry;
+}
+
+// Grow the atlas to fit every glyph used by `text`. No-op if already large
+// enough. Called automatically by drawBitmapString implementations.
+inline void ensureFontAtlasForText(const std::string& text) {
+    int needed = bitmapfont::textRequiredRows(text.data(), text.data() + text.size());
+    if (needed > 0) ensureFontAtlas(needed);
 }
 
 // Draw bitmap string
@@ -1204,6 +1352,15 @@ inline void drawBitmapStringHighlight(const std::string& text, float x, float y,
                                        const Color& background = Color(0, 0, 0),
                                        const Color& foreground = Color(1, 1, 1)) {
     if (text.empty()) return;
+    ensureFontAtlasForText(text);
+    const auto& atlas = internal::bitmapFontAtlas();
+    if (!atlas.atlasInitialized) return;
+
+    // Isolate style: the highlight always wants a solid background and its own
+    // colors. Without this an external noFill() would leave only the rect
+    // outline, and the setColor(background) below would leak to the caller.
+    pushStyle();
+    fill();
 
     // Calculate text size
     float textWidth, textHeight;
@@ -1237,76 +1394,103 @@ inline void drawBitmapStringHighlight(const std::string& text, float x, float y,
     }
 
     // Convert local coordinates to world coordinates (including offset)
-    Mat4 currentMat = getCurrentMatrix();
+    Mat4 currentMat = getMatrix();
     float worldX = currentMat.m[0]*(x + offsetX) + currentMat.m[1]*(y + offsetY) + currentMat.m[3];
     float worldY = currentMat.m[4]*(x + offsetX) + currentMat.m[5]*(y + offsetY) + currentMat.m[7];
 
     // Switch to ortho projection (same coordinate system as drawBitmapString)
     sgl_matrix_mode_projection();
     sgl_push_matrix();
-    sgl_load_identity();
-    sgl_ortho(0.0f, internal::currentViewW, internal::currentViewH, 0.0f, -10000.0f, 10000.0f);
+    internal::sglLoadProjection(internal::screen2DProjection(
+        internal::currentWindowContext().currentViewW, internal::currentWindowContext().currentViewH));
     sgl_matrix_mode_modelview();
     sgl_push_matrix();
     sgl_load_identity();
 
     // Draw background rect (before text, same ortho coordinate system)
-    sgl_load_pipeline((internal::inFboPass && internal::currentFboBlendPipeline.id != 0) ? internal::currentFboBlendPipeline : internal::fontPipeline);
+    internal::loadPipeline(internal::activeFill2D());
     setColor(background);
     drawRect(worldX - paddingH, worldY, textWidth + paddingH * 2, exactHeight);
 
     // Draw text in foreground color
-    sgl_load_pipeline((internal::inFboPass && internal::currentFboBlendPipeline.id != 0) ? internal::currentFboBlendPipeline : internal::fontPipeline);
+    internal::loadPipeline(internal::activeFill2D());
     sgl_enable_texture();
-    sgl_texture(internal::fontView, internal::fontSampler);
+    sgl_texture(atlas.view, atlas.sampler);
 
     sgl_begin_quads();
     sgl_c4f(foreground.r, foreground.g, foreground.b, foreground.a);
-    const float charW = bitmapfont::CHAR_TEX_WIDTH;
     const float charH = bitmapfont::CHAR_TEX_HEIGHT;
+    const float tabW  = bitmapfont::CHAR_TEX_WIDTH * 8.0f;
     float cursorX = worldX;
     float cursorY = worldY;
 
-    for (char c : text) {
-        if (c == '\n') { cursorX = worldX; cursorY += lineHeight; continue; }
-        if (c == '\t') { cursorX += charW * 8; continue; }
-        if (c < 32) continue;
+    {
+        const char* p  = text.data();
+        const char* pe = p + text.size();
+        while (p < pe) {
+            unsigned char b0 = (unsigned char)*p;
+            if (b0 == '\n') { ++p; cursorX = worldX; cursorY += lineHeight; continue; }
+            if (b0 == '\t') { ++p; cursorX += tabW; continue; }
+            if (b0 < 32)    { ++p; continue; }
+            uint32_t cp = bitmapfont::utf8Decode(p, pe);
+            if (cp == 0) break;
 
-        float u, v;
-        bitmapfont::getCharTexCoord(c, u, v);
-        float u2 = u + bitmapfont::TEX_CHAR_WIDTH;
-        float v2 = v + bitmapfont::TEX_CHAR_HEIGHT;
+            float u, v, u2, v2;
+            bitmapfont::getCodepointTexCoord(cp, atlas.rows, u, v, u2, v2);
+            float gw = (float)bitmapfont::codepointPixelWidth(cp);
 
-        sgl_v2f_t2f(cursorX, cursorY, u, v);
-        sgl_v2f_t2f(cursorX + charW, cursorY, u2, v);
-        sgl_v2f_t2f(cursorX + charW, cursorY + charH, u2, v2);
-        sgl_v2f_t2f(cursorX, cursorY + charH, u, v2);
+            sgl_v2f_t2f(cursorX, cursorY, u, v);
+            sgl_v2f_t2f(cursorX + gw, cursorY, u2, v);
+            sgl_v2f_t2f(cursorX + gw, cursorY + charH, u2, v2);
+            sgl_v2f_t2f(cursorX, cursorY + charH, u, v2);
 
-        cursorX += charW;
+            cursorX += gw;
+        }
     }
     sgl_end();
     sgl_disable_texture();
 
-    // Restore current blend pipeline (not default, which has blend disabled)
-    if (internal::inFboPass && internal::currentFboBlendPipeline.id != 0) {
-        sgl_load_pipeline(internal::currentFboBlendPipeline);
-    } else if (internal::blendPipelinesInitialized) {
-        sgl_load_pipeline(internal::blendPipelines[static_cast<int>(internal::currentBlendMode)]);
-    }
+    // Restore current blend pipeline (not default, which has blend disabled).
+    internal::restoreCurrentPipeline();
 
     // Restore matrices
     sgl_pop_matrix();
     sgl_matrix_mode_projection();
     sgl_pop_matrix();
     sgl_matrix_mode_modelview();
+
+    // Restore caller's style (color, fill/stroke, etc.)
+    popStyle();
 }
 
 // ---------------------------------------------------------------------------
 // Window control
 // ---------------------------------------------------------------------------
 
-// Set window title
+namespace internal {
+// Returns true when called from a secondary window's context, emitting a
+// warning that `fn` is main-window only (`why` states the platform
+// limitation), once per `warned` (the caller's own `static OnceGate`). The
+// global window-control functions that have no per-window implementation
+// call this and bail, so a secondary tick can never silently
+// drive the MAIN window (the pre-Phase-2 trap). No-op / false on the main
+// context, where the caller proceeds normally.
+inline bool warnIfSecondaryWindowControl(OnceGate& warned, const char* fn, const char* why) {
+    if (currentWindowContext().isMain) return false;
+    if (warned.isFirstTime()) {
+        logWarning("Window") << fn << "() is main-window only (" << why
+            << "). Called from a secondary window's context — ignored to avoid "
+            "retargeting the main window.";
+    }
+    return true;
+}
+}
+
+// Set window title. Context-aware: from a secondary window's tick/event it
+// retitles THAT window (Window::setTitle); on the main context it retitles the
+// main window as before.
 inline void setWindowTitle(const std::string& title) {
+    if (internal::routeSetWindowTitleToWindow(title)) return;
     sapp_set_window_title(title.c_str());
 }
 
@@ -1345,18 +1529,33 @@ enum class Cursor {
     Custom15    = SAPP_MOUSECURSOR_CUSTOM_15,
 };
 
+// Cursor visibility/shape asymmetry: sokol_app's cursor API targets the main
+// window, and on macOS cursor visibility is app-global (NSCursor hide/unhide is
+// process-wide, not per-NSWindow) — so there is no honest per-secondary-window
+// cursor control. From a secondary context these warn once and no-op rather
+// than silently changing the main window's cursor.
+
 // Show the mouse cursor (default)
 inline void showCursor() {
+    static OnceGate warned;
+    if (internal::warnIfSecondaryWindowControl(warned, "showCursor",
+        "cursor visibility is app-global on macOS and sokol_app targets the main window")) return;
     sapp_show_mouse(true);
 }
 
 // Hide the mouse cursor
 inline void hideCursor() {
+    static OnceGate warned;
+    if (internal::warnIfSecondaryWindowControl(warned, "hideCursor",
+        "cursor visibility is app-global on macOS and sokol_app targets the main window")) return;
     sapp_show_mouse(false);
 }
 
 // Set mouse cursor shape (uses OS system cursors or custom cursors)
 inline void setCursor(Cursor cursor) {
+    static OnceGate warned;
+    if (internal::warnIfSecondaryWindowControl(warned, "setCursor",
+        "sokol_app's cursor shape targets the main window")) return;
     sapp_set_mouse_cursor((sapp_mouse_cursor)cursor);
 }
 
@@ -1393,9 +1592,9 @@ inline void unbindCursorImage(Cursor cursor) {
 
 // Copy string to clipboard
 inline void setClipboardString(const std::string& text) {
-    if (static_cast<int>(text.size()) >= internal::clipboardSize) {
+    if (static_cast<int>(text.size()) >= internal::currentWindowContext().clipboardSize) {
         logWarning("Clipboard") << "Text truncated (" << text.size() << " bytes > "
-            << internal::clipboardSize << " buffer). Use WindowSettings::setClipboardSize() to increase.";
+            << internal::currentWindowContext().clipboardSize << " buffer). Use WindowSettings::setClipboardSize() to increase.";
     }
     sapp_set_clipboard_string(text.c_str());
 }
@@ -1410,7 +1609,21 @@ inline std::string getClipboardString() {
 // pixelPerfect=true: specify in framebuffer size
 // pixelPerfect=false: specify in logical size
 inline void setWindowSize(int width, int height) {
-    if (internal::pixelPerfectMode) {
+    auto& ctx = internal::currentWindowContext();
+    if (!ctx.isMain) {
+        // Secondary window: route to Window::setSize (logical size). Convert
+        // framebuffer -> logical using THIS window's dpi scale in pixel-perfect
+        // mode, mirroring the main path's sapp_dpi_scale() conversion.
+        int lw = width, lh = height;
+        if (internal::pixelPerfectMode()) {
+            float s = ctx.dpiScale > 0.0f ? ctx.dpiScale : 1.0f;
+            lw = static_cast<int>(width / s);
+            lh = static_cast<int>(height / s);
+        }
+        internal::routeSetWindowSizeToWindow(lw, lh);
+        return;
+    }
+    if (internal::pixelPerfectMode()) {
         // Pixel perfect mode: convert framebuffer size to logical size
         float scale = sapp_dpi_scale();
         setWindowSizeLogical(static_cast<int>(width / scale), static_cast<int>(height / scale));
@@ -1420,27 +1633,37 @@ inline void setWindowSize(int width, int height) {
     }
 }
 
-// Toggle fullscreen
+// Fullscreen. Context-aware: sapp_toggle_fullscreen()/sapp_is_fullscreen() only
+// act on the main window, so from a secondary window's tick/event these route to
+// THAT window's native per-window fullscreen (macOS NSWindow toggleFullScreen:,
+// Win32 borderless-fullscreen style swap, X11 EWMH _NET_WM_STATE_FULLSCREEN —
+// see Window::setFullscreen). On the main context they behave exactly as before.
+
+// Enter / leave fullscreen.
 inline void setFullscreen(bool full) {
+    if (internal::routeSetFullscreenToWindow(full)) return;
     if (full != sapp_is_fullscreen()) {
         sapp_toggle_fullscreen();
     }
 }
 
-// Get fullscreen state
+// Get fullscreen state (of the current window's context).
 inline bool isFullscreen() {
+    bool out = false;
+    if (internal::routeIsFullscreenFromWindow(out)) return out;
     return sapp_is_fullscreen();
 }
 
-// Toggle fullscreen
+// Toggle fullscreen.
 inline void toggleFullscreen() {
+    if (internal::routeToggleFullscreenToWindow()) return;
     sapp_toggle_fullscreen();
 }
 
 // ---------------------------------------------------------------------------
 // Orientation control (iOS only, no-op on other platforms)
 // ---------------------------------------------------------------------------
-enum class Orientation : uint32_t {
+enum class TC_PLATFORMS("android,ios") Orientation : uint32_t {
     Portrait            = (1 << 1),  // UIInterfaceOrientationMaskPortrait
     PortraitUpsideDown  = (1 << 2),  // UIInterfaceOrientationMaskPortraitUpsideDown
     LandscapeLeft       = (1 << 4),  // UIInterfaceOrientationMaskLandscapeLeft
@@ -1458,10 +1681,12 @@ inline Orientation operator&(Orientation a, Orientation b) {
     return static_cast<Orientation>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
 }
 
-// Set supported orientations (iOS only)
-inline void setOrientation(Orientation mask) {
-    sapp_ios_set_supported_orientations(static_cast<uint32_t>(mask));
-}
+// Set supported orientations.
+// iOS:     UIInterfaceOrientationMask via sokol_app
+// Android: Activity.setRequestedOrientation via JNI
+// Desktop / Web: no-op
+// (Implementation lives in core/platform/<plat>/tcPlatform_<plat>.{cpp,mm})
+TC_PLATFORMS("android,ios") void setOrientation(Orientation mask);
 
 // ---------------------------------------------------------------------------
 // Window information (size corresponding to coordinate system)
@@ -1469,18 +1694,18 @@ inline void setOrientation(Orientation mask) {
 
 // Get window width (size corresponding to coordinate system)
 inline int getWindowWidth() {
-    if (internal::pixelPerfectMode) {
-        return sapp_width();  // Framebuffer size
+    if (internal::pixelPerfectMode()) {
+        return getFramebufferWidth();  // Framebuffer size
     }
-    return static_cast<int>(sapp_width() / sapp_dpi_scale());  // Logical size
+    return static_cast<int>(getFramebufferWidth() / getDpiScale());  // Logical size
 }
 
 // Get window height (size corresponding to coordinate system)
 inline int getWindowHeight() {
-    if (internal::pixelPerfectMode) {
-        return sapp_height();  // Framebuffer size
+    if (internal::pixelPerfectMode()) {
+        return getFramebufferHeight();  // Framebuffer size
     }
-    return static_cast<int>(sapp_height() / sapp_dpi_scale());  // Logical size
+    return static_cast<int>(getFramebufferHeight() / getDpiScale());  // Logical size
 }
 
 // Get window size as Vec2
@@ -1488,68 +1713,24 @@ inline Vec2 getWindowSize() {
     return Vec2(static_cast<float>(getWindowWidth()), static_cast<float>(getWindowHeight()));
 }
 
-// Aspect ratio
+// Aspect ratio (of the CURRENT window's framebuffer, like getWindowWidth/Height)
 inline float getAspectRatio() {
-    return static_cast<float>(sapp_width()) / static_cast<float>(sapp_height());
+    return static_cast<float>(getFramebufferWidth()) /
+           static_cast<float>(getFramebufferHeight());
 }
 
 // ---------------------------------------------------------------------------
 // Time
 // ---------------------------------------------------------------------------
 
-inline double getElapsedTime() {
-    auto now = std::chrono::high_resolution_clock::now();
-    if (!internal::startTimeInitialized) {
-        internal::startTime = now;
-        internal::startTimeInitialized = true;
-        return 0.0;
-    }
-    auto duration = std::chrono::duration<double>(now - internal::startTime);
-    return duration.count();
-}
-
-// Number of update calls
-// In decoupled mode, may be called more frequently than draw
-inline uint64_t getUpdateCount() {
-    return internal::updateFrameCount;
-}
-
-// Draw frame count (sokol's frame_count)
-inline uint64_t getDrawCount() {
-    return sapp_frame_count();
-}
-
-// Alias for getUpdateCount (for general use)
-inline uint64_t getFrameCount() {
-    return internal::updateFrameCount;
-}
-
-inline double getDeltaTime() {
-    return internal::updateDeltaTime;
-}
-
-// Get frame rate (10-frame moving average, based on update delta time)
-inline double getFrameRate() {
-    // Add current update delta time to buffer
-    double dt = internal::updateDeltaTime;
-    if (dt <= 0.0) return 0.0;
-    internal::frameTimeBuffer[internal::frameTimeIndex] = dt;
-    internal::frameTimeIndex = (internal::frameTimeIndex + 1) % 10;
-    if (internal::frameTimeIndex == 0) {
-        internal::frameTimeBufferFilled = true;
-    }
-
-    // Calculate average
-    int count = internal::frameTimeBufferFilled ? 10 : internal::frameTimeIndex;
-    if (count == 0) return 0.0;
-
-    double sum = 0.0;
-    for (int i = 0; i < count; i++) {
-        sum += internal::frameTimeBuffer[i];
-    }
-    double avgDt = sum / count;
-    return avgDt > 0.0 ? 1.0 / avgDt : 0.0;
-}
+// Non-inline: Host/Guest share the same state on Windows hot-reload
+double getElapsedTime();
+double getFrameElapsedTime();
+uint64_t getUpdateCount();
+uint64_t getDrawCount();
+uint64_t getFrameCount();
+double getDeltaTime();
+double getFrameRate();
 
 // ---------------------------------------------------------------------------
 // Sokol memory tracking
@@ -1571,56 +1752,43 @@ inline void releaseSglBuffers() {
 // ---------------------------------------------------------------------------
 // Mouse state (global / window coordinates)
 // ---------------------------------------------------------------------------
-
-// Current mouse X coordinate (window coordinates)
-inline float getGlobalMouseX() {
-    return internal::mouseX;
-}
-
-// Current mouse Y coordinate (window coordinates)
-inline float getGlobalMouseY() {
-    return internal::mouseY;
-}
-
-// Previous frame mouse X coordinate (window coordinates)
-inline float getGlobalPMouseX() {
-    return internal::pmouseX;
-}
-
-// Previous frame mouse Y coordinate (window coordinates)
-inline float getGlobalPMouseY() {
-    return internal::pmouseY;
-}
+// getGlobalMouseX/Y, getGlobalPMouseX/Y live in tc/app/tcMouseGlobal.h.
 
 // Is mouse button pressed
 inline bool isMousePressed() {
-    return internal::mousePressed;
+    return internal::currentWindowContext().mousePressed;
 }
 
 // Currently pressed mouse button (-1 = none)
 inline int getMouseButton() {
-    return internal::mouseButton;
+    return internal::currentWindowContext().mouseButton;
 }
 
 // Is specific key currently pressed
 inline bool isKeyPressed(int key) {
-    return internal::keysPressed.count(key) > 0;
+    return internal::currentWindowContext().keysPressed.count(key) > 0;
 }
 
-// Alias for getGlobalMouseX/Y (for tcDebugInput)
-inline float getMouseX() { return internal::mouseX; }
-inline float getMouseY() { return internal::mouseY; }
-inline Vec2 getMousePos() { return Vec2(internal::mouseX, internal::mouseY); }
-inline Vec2 getGlobalMousePos() { return Vec2(getGlobalMouseX(), getGlobalMouseY()); }
+// "Either-side" modifier checks. Return true while either the left or
+// right variant is held. Safe to call from setup / update / draw / any
+// event handler — they just read the global key-state set.
+// (Uses raw SAPP_KEYCODE_* here because the KEY_LEFT_SHIFT et al aliases
+// are defined further down in this header.)
+inline bool isShiftPressed()   { return isKeyPressed(SAPP_KEYCODE_LEFT_SHIFT)   || isKeyPressed(SAPP_KEYCODE_RIGHT_SHIFT); }
+inline bool isControlPressed() { return isKeyPressed(SAPP_KEYCODE_LEFT_CONTROL) || isKeyPressed(SAPP_KEYCODE_RIGHT_CONTROL); }
+inline bool isAltPressed()     { return isKeyPressed(SAPP_KEYCODE_LEFT_ALT)     || isKeyPressed(SAPP_KEYCODE_RIGHT_ALT); }
+inline bool isSuperPressed()   { return isKeyPressed(SAPP_KEYCODE_LEFT_SUPER)   || isKeyPressed(SAPP_KEYCODE_RIGHT_SUPER); }
+
+// getMouseX/Y, getMousePos, getGlobalMousePos live in tc/app/tcMouseGlobal.h.
 
 // ---------------------------------------------------------------------------
 // Touch-as-mouse mapping
 // When enabled, the first touch point is also delivered as mouse events.
 // Useful for running desktop apps (that use mousePressed) on mobile unchanged.
-// Default: OFF. Call setTouchAsMouse(true) in setup() for mobile apps.
+// Default: ON everywhere. Call setTouchAsMouse(false) in setup() to opt out.
 // ---------------------------------------------------------------------------
-inline void setTouchAsMouse(bool enabled) { internal::touchAsMouse = enabled; }
-inline bool getTouchAsMouse() { return internal::touchAsMouse; }
+inline void setTouchAsMouse(bool enabled) { internal::touchAsMouse() = enabled; }
+inline bool getTouchAsMouse() { return internal::touchAsMouse(); }
 
 // ---------------------------------------------------------------------------
 // System Information
@@ -1675,15 +1843,18 @@ inline size_t getMemoryUsage() {
 // ---------------------------------------------------------------------------
 // Resource Counters (for debugging)
 // ---------------------------------------------------------------------------
+// Defined in tcGlobal.cpp, one per process: the objects a Windows hot reload
+// guest creates count in the same totals as the host's, and getNodeCount() in
+// either reads them all. The constructors and destructors bump them.
 namespace internal {
-    inline std::atomic<size_t> nodeCount{0};
-    inline std::atomic<size_t> textureCount{0};
-    inline std::atomic<size_t> fboCount{0};
+    std::atomic<size_t>& nodeCount();
+    std::atomic<size_t>& textureCount();
+    std::atomic<size_t>& fboCount();
 }
 
-inline size_t getNodeCount() { return internal::nodeCount.load(); }
-inline size_t getTextureCount() { return internal::textureCount.load(); }
-inline size_t getFboCount() { return internal::fboCount.load(); }
+inline size_t getNodeCount() { return internal::nodeCount().load(); }
+inline size_t getTextureCount() { return internal::textureCount().load(); }
+inline size_t getFboCount() { return internal::fboCount().load(); }
 
 // ---------------------------------------------------------------------------
 // Loop Architecture (Decoupled Update/Draw)
@@ -1703,38 +1874,130 @@ struct FpsSettings {
 
 // --- Main FPS API ---
 
+namespace internal {
+// Restart the main loop's update and/or draw timing after a real mode change
+// (#228), so the new mode does not replay the time spent in the previous one.
+// The timestamps re-base at the next frame, and each accumulator is seeded
+// with one interval: that frame runs one fixed update step / draws (the switch
+// doesn't cost a frame), and the new phase starts there.
+//
+// The measured delta (VSYNC / setFps() modes) must not replay the previous
+// mode either, but must keep the time that really belongs to the new one:
+// - Switched between updates (a key handler, draw(), runOnMainThread work):
+//   the baseline moves to the switch, so the first update of the new mode
+//   reports the time since the switch (not an hour of EVENT_DRIVEN idle,
+//   but the wait for the first redraw() after it). Once the loop runs, this
+//   also sets the first baseline when there is none yet (setup() running in
+//   the first draw() of an EVENT_DRIVEN update).
+// - Switched inside an update: the baseline stays at that update's start,
+//   so the next update counts all of it, including work done before the
+//   call (setup() { callAfter(3.0); load 4 s; setFps(60); } still fires the
+//   timer right after the load).
+// - Before the loop runs there is no baseline; the first update uses
+//   sokol's estimate.
+// A switch to a measured mode inside a fixed-Hz step also ends that step's
+// fixed-step mark, so a timer created later in the step counts from its
+// creation. A changed update mode also ends the remaining old steps of a
+// fixed-Hz frame when the switch comes from inside update()
+// (runIndependentUpdates checks the timestamp flag).
+inline void restartLoopTiming(bool update, bool draw) {
+    auto& loop = mainLoop();
+    if (update) {
+        loop.lastUpdateTimeInitialized = false;
+        auto& wctx = mainWindowContext();
+        const bool fixedStep = !loop.updateSyncedToDraw && loop.updateTargetFps > 0.0f;
+        if (!wctx.inUpdate &&
+            (wctx.mainUpdateCallTimeInitialized || wctx.frameUptimeSampled)) {
+            wctx.mainUpdateCallTime = std::chrono::steady_clock::now();
+            wctx.mainUpdateCallTimeInitialized = true;
+        }
+        if (!fixedStep) wctx.fixedStepUpdate = false;
+        loop.updateAccumulator = fixedStep ? 1.0 / loop.updateTargetFps : 0.0;
+    }
+    if (draw) {
+        loop.lastDrawTimeInitialized = false;
+        loop.drawAccumulator = (loop.drawTargetFps > 0.0f) ? 1.0 / loop.drawTargetFps : 0.0;
+    }
+}
+} // namespace internal
+
 // Set FPS (update and draw synchronized, 1:1)
 // VSYNC: sync to monitor refresh rate
 // EVENT_DRIVEN: only on redraw() call
 // > 0: fixed fps
 inline void setFps(float fps) {
-    internal::updateTargetFps = fps;
-    internal::drawTargetFps = fps;
-    internal::updateSyncedToDraw = true;
-    internal::updateAccumulator = 0.0;
-    internal::drawAccumulator = 0.0;
+    // Context-aware: called during a secondary window's tick it retargets THAT
+    // window's throttle (Window::setFps); on the main context it steers the main
+    // loop exactly as before. This removes the pre-Phase-2 trap where setFps()
+    // from secondary app code silently retuned the main loop.
+    auto& wctx = internal::currentWindowContext();
+    if (!wctx.isMain) {
+        wctx.throttleFps = fps;
+        return;
+    }
+    // Only a real change restarts the timing: re-applying the current rate
+    // (setFps(guiValue) every frame) must not skip frames.
+    auto& loop = internal::mainLoop();
+    const bool updateChanged = !loop.updateSyncedToDraw || loop.updateTargetFps != fps;
+    const bool drawChanged = loop.drawTargetFps != fps;
+    if (!updateChanged && !drawChanged) return;
+    loop.updateTargetFps = fps;
+    loop.drawTargetFps = fps;
+    loop.updateSyncedToDraw = true;
+    internal::restartLoopTiming(updateChanged, drawChanged);
 }
 
 // Set independent FPS for update and draw (not synchronized)
-// Each loop runs at its own rate, may cause timing variations
+// Each loop runs at its own rate, may cause timing variations.
+// MAIN-WINDOW ONLY: a secondary window has a single synced throttle rate
+// (Window::setFps); calling this from a secondary tick logs once and no-ops.
 inline void setIndependentFps(float updateFps, float drawFps) {
-    internal::updateTargetFps = updateFps;
-    internal::drawTargetFps = drawFps;
-    internal::updateSyncedToDraw = false;
-    internal::updateAccumulator = 0.0;
-    internal::drawAccumulator = 0.0;
+    if (!internal::currentWindowContext().isMain) {
+        static OnceGate warned;
+        if (warned.isFirstTime()) {
+            logWarning("Window") << "setIndependentFps() is main-window only; a "
+                "secondary window runs a single synced rate. Use Window::setFps() "
+                "(or the context-aware setFps()). Ignored.";
+        }
+        return;
+    }
+    // Only a real change restarts the timing (per loop): re-applying the
+    // current rates every frame must not starve update or skip draws, and
+    // changing only the draw rate leaves the update's phase alone.
+    auto& loop = internal::mainLoop();
+    const bool updateChanged = loop.updateSyncedToDraw || loop.updateTargetFps != updateFps;
+    const bool drawChanged = loop.drawTargetFps != drawFps;
+    if (!updateChanged && !drawChanged) return;
+    loop.updateTargetFps = updateFps;
+    loop.drawTargetFps = drawFps;
+    loop.updateSyncedToDraw = false;
+    internal::restartLoopTiming(updateChanged, drawChanged);
 }
+
+// Cap on the fixed-rate update steps run in one frame (setIndependentFps with
+// an update rate) or in one runHeadlessApp loop pass. More are pending after
+// a stall, when update() is slower than its own rate, or when the update rate
+// is more than this many times the display rate; the time beyond the cap is
+// dropped with a one-time warning instead of replayed. Default 10. 0 or less
+// removes the cap: every step runs (e.g. a deterministic simulation), at the
+// cost of a freeze while a long stall is replayed, and of frames (or
+// headless passes) that grow longer and longer while update() is slower than
+// its own rate.
+// Non-inline (tcGlobal.cpp): the hot-reload Host and Guest share the setting.
+void setMaxUpdateSteps(int steps);
+int getMaxUpdateSteps();
 
 // Get current FPS settings
 inline FpsSettings getFpsSettings() {
+    const auto& loop = internal::mainLoop();
     FpsSettings settings;
-    settings.updateFps = internal::updateTargetFps;
-    settings.drawFps = internal::drawTargetFps;
-    settings.synced = internal::updateSyncedToDraw;
+    settings.updateFps = loop.updateTargetFps;
+    settings.drawFps = loop.drawTargetFps;
+    settings.synced = loop.updateSyncedToDraw;
 
     // Get actual VSync frequency (approximate from frame duration when VSYNC)
-    if (internal::updateTargetFps == internal::VSYNC ||
-        internal::drawTargetFps == internal::VSYNC) {
+    if (loop.updateTargetFps == internal::VSYNC ||
+        loop.drawTargetFps == internal::VSYNC) {
         double dt = sapp_frame_duration();
         settings.actualVsyncFps = (dt > 0.0) ? static_cast<float>(1.0 / dt) : 0.0f;
     } else {
@@ -1744,7 +2007,8 @@ inline FpsSettings getFpsSettings() {
     return settings;
 }
 
-// Get current actual FPS (measured, 10-frame moving average)
+// Get current actual FPS (measured update rate over the last 10 frames; in
+// fixed-Hz update mode the measured rate, not the configured one).
 // Alias for getFrameRate() with clearer naming
 inline float getFps() {
     return static_cast<float>(getFrameRate());
@@ -1752,9 +2016,21 @@ inline float getFps() {
 
 // Request redraw (used when auto-draw is stopped)
 // count: number of draws (max value is used when called multiple times)
+// MAIN-WINDOW ONLY: the event-driven / redraw() loop drives the main window's
+// _frame_cb. Secondary windows are paced by their own display link (Window::
+// setFps throttles them); redraw() from a secondary tick logs once and no-ops.
 inline void redraw(int count = 1) {
-    if (count > internal::redrawCount) {
-        internal::redrawCount = count;
+    if (!internal::currentWindowContext().isMain) {
+        static OnceGate warned;
+        if (warned.isFirstTime()) {
+            logWarning("Window") << "redraw() / event-driven loop is main-window "
+                "only; secondary windows are paced by their display link. Ignored.";
+        }
+        return;
+    }
+    auto& loop = internal::mainLoop();
+    if (count > loop.redrawCount) {
+        loop.redrawCount = count;
     }
 }
 
@@ -1774,10 +2050,126 @@ inline void exitApp() {
 // Screenshot
 // ---------------------------------------------------------------------------
 
+namespace internal {
+#if defined(__APPLE__)
+    // A completed GPU readback the consumer copies into ITS OWN destination,
+    // with a single getBytes and no intermediate buffer. Lets the screen recorder
+    // read straight into the encoder's CVPixelBuffer (BGRA, no swap) and
+    // screenshots read into a Pixels buffer (RGBA). `staging` is the bridged
+    // id<MTLTexture>, valid only for the duration of the completion callback.
+    struct CaptureReadback {
+        void* staging = nullptr;   // id<MTLTexture> (bridged, not retained here)
+        int   width = 0;
+        int   height = 0;
+        bool  isRGB10A2 = false;
+        // Copy the readback into dst (dstStride bytes per row). wantRGBA=false
+        // keeps native BGRA8 order (matches the encoder's CVPixelBuffer);
+        // wantRGBA=true yields RGBA8 (for Pixels / screenshots).
+        void readInto(unsigned char* dst, int dstStride, bool wantRGBA) const;
+    };
 
-// Capture screen to Pixels
-inline bool grabScreen(Pixels& outPixels) {
+    // macOS: asynchronous window capture. Issues the GPU readback blit and
+    // returns immediately; `completion` runs later (on a Metal background thread)
+    // with a CaptureReadback once the GPU finishes — no per-frame
+    // waitUntilCompleted stall. Returns false if there is no frame to capture.
+    // (Implemented in platform/mac/tcPlatform_mac.mm; captureWindow() is just
+    // this plus an inline wait.)
+    bool captureWindowAsync(
+        const std::function<void(const CaptureReadback&)>& completion);
+#endif
+}
+
+// Capture screen to Pixels.
+// NOTE: immediate readback — call this OUTSIDE draw() (e.g. at the end of
+// update() or from an events().afterFrame listener). During draw() nothing has
+// been rendered yet (drawing is deferred to present()), so on Linux you'd read
+// a blank framebuffer. If you just want a file of the current frame, prefer
+// saveScreenshot() which captures at the correct point automatically.
+// Web: not implemented (no canvas readback). Always returns false and warns
+// once; take screenshots with the browser's own tools instead.
+TC_PLATFORMS("macos,windows,linux,ios,android") inline bool grabScreen(Pixels& outPixels) {
     return captureWindow(outPixels);
+}
+
+namespace internal {
+    // Capture every path queued by saveScreenshot() on the CURRENT window's
+    // queue (WindowContext::pendingScreenshotPaths) and clear it. Called right
+    // after present() while that window's context — and thus its
+    // lastSwapchainDrawable — is current: the main window from the afterFrame
+    // listener installed in _setup_cb, each secondary window from its own
+    // windowTick (platform/*/tcWindow*). Failures log via logError.
+    // A secondary window also answers the MCP requests aimed at it here
+    // (tc_get_screenshot / tc_save_screenshot with a window index): only
+    // inside its own tick is its drawable the one a readback sees (#243).
+    // The main window's are drained by the same afterFrame listener.
+    inline void drainPendingScreenshots() {
+        auto& ctx = currentWindowContext();
+        #ifndef __EMSCRIPTEN__
+        if (!ctx.isMain) mcp::drainDeferredResponses(&ctx);
+        #endif
+        auto& queue = ctx.pendingScreenshotPaths;
+        if (queue.empty()) return;
+        for (const auto& p : queue) {
+            captureWindowToFile(p);
+        }
+        queue.clear();
+    }
+    // Keeps the afterFrame drain subscription alive for the app's lifetime.
+    // Host-only, so a per-module copy is fine: installed in _setup_cb.
+    inline EventListener screenshotAfterFrameListener;
+}
+
+// Save a screenshot of the current frame to a file. Safe to call from anywhere
+// (setup/update/draw/event handlers): the actual capture is deferred to just
+// after present(), so it always grabs the fully-rendered frame — no black
+// captures on Linux when called inside draw().
+//
+// Returns true if the destination was prepared and the capture was queued;
+// false if the parent directory could not be created (e.g. no write
+// permission). The rare failure of the deferred write itself (permission/disk
+// after the directory check) is reported via logError("Screenshot").
+// Relative paths resolve against the data path. The format comes from the
+// extension (case-insensitive): png/jpg/jpeg/bmp; macOS also writes tiff/tif/gif,
+// Windows also tga. Unsupported or missing extensions append .png and warn
+// with the actual destination and supported formats.
+//
+// Web: not implemented (no canvas readback). Always returns false (nothing is
+// queued or written) and warns once, pointing to the browser's own screenshot
+// feature.
+TC_PLATFORMS("macos,windows,linux,ios,android") inline bool saveScreenshot(const std::filesystem::path& path) {
+#ifdef __EMSCRIPTEN__
+    // Web capture is not implemented: nothing reads the canvas back (see
+    // platform/web/tcPlatform_web.cpp). So fail up front instead of queuing a
+    // capture that would never write a file while this call reported success.
+    // The web captureWindowToFile() stub returns false and warns once.
+    return internal::captureWindowToFile(path);
+#else
+    // Resolve relative paths up front so the deferred worker gets an absolute one.
+    std::filesystem::path resolved = internal::resolveScreenshotPath(path);
+
+    // Auto-create the parent directory (mirrors VideoRecorder). This is the
+    // failure users want to catch synchronously (missing/unwritable folder).
+    std::error_code ec;
+    std::filesystem::path parent = resolved.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            logError("Screenshot") << "Cannot prepare destination directory: "
+                                   << parent << " (" << ec.message() << ")";
+            return false;
+        }
+    }
+
+    internal::currentWindowContext().pendingScreenshotPaths.push_back(std::move(resolved));
+    // Guarantee a present() (and thus the afterFrame drain) even when paused.
+    // redraw() only pokes the MAIN loop's redrawCount, so it applies to the main
+    // window only. A secondary window free-runs at vsync while visible and drains
+    // this queue on its next tick, so no redraw is needed (nor available) there.
+    if (internal::currentWindowContext().isMain) {
+        redraw();
+    }
+    return true;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1814,6 +2206,10 @@ constexpr int KEY_RIGHT_ALT = SAPP_KEYCODE_RIGHT_ALT;
 constexpr int KEY_LEFT_SUPER = SAPP_KEYCODE_LEFT_SUPER;
 constexpr int KEY_RIGHT_SUPER = SAPP_KEYCODE_RIGHT_SUPER;
 
+// "Either-side" modifier checks live as free functions (see below);
+// no KEY_SHIFT / KEY_CONTROL sentinel constants on purpose — those would
+// silently no-op if passed to isKeyPressed(). Use isShiftPressed() etc.
+
 // Function keys
 constexpr int KEY_F1 = SAPP_KEYCODE_F1;
 constexpr int KEY_F2 = SAPP_KEYCODE_F2;
@@ -1828,10 +2224,12 @@ constexpr int KEY_F10 = SAPP_KEYCODE_F10;
 constexpr int KEY_F11 = SAPP_KEYCODE_F11;
 constexpr int KEY_F12 = SAPP_KEYCODE_F12;
 
-// Mouse buttons
-constexpr int MOUSE_BUTTON_LEFT = SAPP_MOUSEBUTTON_LEFT;
-constexpr int MOUSE_BUTTON_RIGHT = SAPP_MOUSEBUTTON_RIGHT;
-constexpr int MOUSE_BUTTON_MIDDLE = SAPP_MOUSEBUTTON_MIDDLE;
+// Mouse buttons (legacy int constants, for the simple App::mousePressed(Vec2, int)
+// form. Derived from the MouseButton enum so there is a single source of truth;
+// for the MouseEventArgs::button enum itself, use MouseButton::Left etc.)
+constexpr int MOUSE_BUTTON_LEFT = (int)MouseButton::Left;
+constexpr int MOUSE_BUTTON_RIGHT = (int)MouseButton::Right;
+constexpr int MOUSE_BUTTON_MIDDLE = (int)MouseButton::Middle;
 
 // ---------------------------------------------------------------------------
 // Window settings
@@ -1845,8 +2243,13 @@ struct WindowSettings {
     bool pixelPerfect = false;  // true: coords = framebuffer size, false: coords = logical size
     int sampleCount = 4;  // MSAA (default 4x, 8x not supported on some devices)
     bool fullscreen = false;
+    bool decorated = true;  // false: borderless/chromeless window (no title bar)
     int clipboardSize = 65536;  // Clipboard buffer size (default 64KB)
     int swapInterval = 1;  // VSync: 1 = on (default), 0 = off
+    int uniformBufferReserve = 0;  // per-frame GPU uniform reservation in bytes;
+                                   // 0 = backend default (4MB ≈ 8k draws). Only
+                                   // Metal/WebGPU/Vulkan use it (ring buffer);
+                                   // GL/D3D11 have no such cap.
     // bool headless = false;  // For future use
 
     WindowSettings& setSize(int w, int h) {
@@ -1883,8 +2286,39 @@ struct WindowSettings {
         return *this;
     }
 
+    // false = borderless/chromeless window (no title bar, no buttons) that can
+    // still take keyboard focus and be closed programmatically (exitApp()).
+    WindowSettings& setDecorated(bool enabled) {
+        decorated = enabled;
+        return *this;
+    }
+
     WindowSettings& setClipboardSize(int size) {
         clipboardSize = size;
+        return *this;
+    }
+
+    // VSync / present interval. 1 = sync to display refresh (default), 0 = off.
+    // N > 1 presents every Nth refresh: on a 120Hz display, 2 -> 60fps, 4 -> 30.
+    // On Apple this also drives the display-link rate (true sub-refresh fps,
+    // not just frame skipping). Only integer divisors of the refresh are
+    // expressible this way; for arbitrary rates use setFps().
+    WindowSettings& setSwapInterval(int interval) {
+        swapInterval = interval;
+        return *this;
+    }
+
+    // Reserve the per-frame GPU uniform buffer, in bytes (0 = default: 1MB on
+    // Metal, 4MB on WebGPU/Vulkan). Like std::vector::reserve: on Metal the
+    // ring auto-grows (doubling, with a warning log) when a frame overflows it,
+    // so a sufficient reservation only skips the one-time grow hitch. Every
+    // draw call takes a 256-byte-aligned slice of this ring buffer (~4MB per
+    // 8k draw calls per frame). WebGPU/Vulkan do NOT auto-grow yet: there an
+    // overflowing frame is still an error, so size this generously for very
+    // high draw-call scenes. GL/D3D11 ignore it — they have no such cap.
+    // Metal/WebGPU/Vulkan allocate it x2 (in-flight frames).
+    WindowSettings& reserveUniformBuffer(int bytes) {
+        uniformBufferReserve = bytes;
         return *this;
     }
 };
@@ -1893,23 +2327,30 @@ struct WindowSettings {
 // Application execution (internal implementation)
 // ---------------------------------------------------------------------------
 
+// Host-only state, so a per-module copy is fine (tools/header_state_allowlist.txt):
+// the launcher (runApp / runHotReloadApp) and the sokol callbacks below are
+// compiled into the host; a hot reload guest's copies are never used.
 namespace internal {
     // App instance (held as void*)
     inline void* appInstance = nullptr;
     inline int currentMouseButton = -1;
+
+    // Window decoration requested via WindowSettings; applied in _setup_cb once
+    // the platform window exists (sokol has no decoration flag in sapp_desc).
+    inline bool windowDecorated = true;
 
     // Callback function pointers
     inline void (*appSetupFunc)() = nullptr;
     inline void (*appUpdateFunc)() = nullptr;
     inline void (*appDrawFunc)() = nullptr;
     inline void (*appCleanupFunc)() = nullptr;
-    inline void (*appKeyPressedFunc)(int) = nullptr;
-    inline void (*appKeyReleasedFunc)(int) = nullptr;
-    inline void (*appMousePressedFunc)(int, int, int) = nullptr;
-    inline void (*appMouseReleasedFunc)(int, int, int) = nullptr;
-    inline void (*appMouseMovedFunc)(int, int) = nullptr;
-    inline void (*appMouseDraggedFunc)(int, int, int) = nullptr;
-    inline void (*appMouseScrolledFunc)(float, float) = nullptr;
+    inline void (*appKeyPressedFunc)(const KeyEventArgs&) = nullptr;
+    inline void (*appKeyReleasedFunc)(const KeyEventArgs&) = nullptr;
+    inline void (*appMousePressedFunc)(const MouseEventArgs&) = nullptr;
+    inline void (*appMouseReleasedFunc)(const MouseEventArgs&) = nullptr;
+    inline void (*appMouseMovedFunc)(const internal::MouseEventRaw&) = nullptr;
+    inline void (*appMouseDraggedFunc)(const internal::MouseEventRaw&) = nullptr;
+    inline void (*appMouseScrolledFunc)(const ScrollEventArgs&) = nullptr;
     inline void (*appWindowResizedFunc)(int, int) = nullptr;
     inline void (*appFilesDroppedFunc)(const std::vector<std::string>&) = nullptr;
 } // namespace internal
@@ -1919,18 +2360,46 @@ namespace mcp {
     void registerDebuggerTools();
 }
 
+// Defined in tc/sound/tcSound.h (included later in this header); declared here
+// so the cleanup callback below can stop the audio device on exit.
+inline void shutdownAudio();
+// tcAudio_impl.cpp: logs the dropped plays that were only counted (see tcSound.h).
+namespace internal { void pumpAudioDiagnostics(); }
+// Defined in tcBaseApp.h (included later in this header); declared here so
+// the launcher's cleanup below can detach the App's audio hooks (#256).
+class App;
+namespace internal { inline void detachAppAudio(App& app); }
+
 namespace internal {
 
+    // Ops integration: a supervisor (e.g. `anchorbolt start`) injects a log
+    // file path via the environment so the app needs zero code changes.
+    // runApp() and the hot reload host open it BEFORE sapp_run(), so the
+    // init-time failures sokol reports (e.g. no X display on Linux) and
+    // setup-time log lines land in the file too.
+    inline void openEnvLogFile() {
+        #ifndef __EMSCRIPTEN__
+        if (const char* envLog = std::getenv("TRUSSC_LOG_FILE")) {
+            if (envLog[0] != '\0' && !setLogFile(envLog)) {
+                logWarning("System") << "TRUSSC_LOG_FILE: cannot open '" << envLog << "'";
+            }
+        }
+        #endif
+    }
+
     inline void _setup_cb() {
+        // Record the main thread id while we are guaranteed to be on it.
+        // isMainThread() / runOnMainThread() / the Node main-thread asserts all
+        // key off this. (sokol's init_cb runs on the main thread.)
+        getMainThreadId();
+
+        // TRUSSC_LOG_FILE was opened before sapp_run() (openEnvLogFile above).
+
         setup();
 
-        // For macOS bundles, set default data path
-        // Executable: bin/xxx.app/Contents/MacOS/xxx
-        // data: bin/data/
-        // ../../../ = bin/, so ../../../data/ is the correct path
-        #ifdef __APPLE__
-        setDataPathRoot("../../../data/");
-        #endif
+        // App's pre-setup hook resolves the data path root right before its
+        // setup() runs. getDataPath() also probes on an earlier call; probing
+        // here is too early to see a valid executable path on iOS.
 
         // Start console input thread (enabled by default)
         // To disable, call console::stop() in setup()
@@ -1952,129 +2421,263 @@ namespace internal {
                 mcpPort = std::atoi(envPort);
             }
 
-            // Start HTTP server for MCP transport
-            mcp::startHttpServer(mcpPort);
+            // Host defaults to 127.0.0.1 (loopback-only, the same address on
+            // every OS; see startHttpServer). Set TRUSSC_MCP_HOST
+            // (e.g. 0.0.0.0) to expose externally — requires TRUSSC_MCP_TOKEN,
+            // otherwise startHttpServer refuses to bind (fail-closed).
+            const char* envHost = std::getenv("TRUSSC_MCP_HOST");
+            std::string mcpHost = envHost ? envHost : "127.0.0.1";
+            const char* envToken = std::getenv("TRUSSC_MCP_TOKEN");
+            std::string mcpToken = envToken ? envToken : "";
 
-            logNotice("System") << "MCP HTTP server started";
+            // Start HTTP server for MCP transport
+            // The server thread logs "[MCP] HTTP server listening on
+            // http://HOST:PORT/mcp" once it has bound the port.
+            mcp::startHttpServer(mcpPort, mcpHost, mcpToken);
         }
         #endif
+
+        // Drain deferred screenshot/MCP captures right after present(), where the
+        // swapchain is committed and we are outside any pass — the only safe
+        // readback point (see grabScreen()/saveScreenshot()).
+        internal::screenshotAfterFrameListener = events().afterFrame.listen([]() {
+            // Main window: currentWindowContext() resolves to the main context
+            // here, so this drains the main window's queue (secondary windows
+            // drain their own in windowTick).
+            internal::drainPendingScreenshots();
+            #ifndef __EMSCRIPTEN__
+            mcp::drainDeferredResponses();
+            #endif
+        });
 
         // Install the standard application menu on macOS so Cmd+Q etc. work
         // out of the box. No-op on other platforms.
         internal::installAppMenu();
 
+        // Apply borderless/chromeless decoration if requested (the window now
+        // exists). Kept key-focusable and closable so exitApp() still works.
+        if (!internal::windowDecorated) {
+            setWindowDecorated(false);
+        }
+
         // Bring window to front on startup
         bringWindowToFront();
 
-        if (appSetupFunc) appSetupFunc();
+        // App code (the App's constructor) runs here: an entry point (#349).
+        if (appSetupFunc) {
+            EntryStackGuard guard(AppEntry::Setup);
+            appSetupFunc();
+        }
 
         // Set initial app size (must be after appSetupFunc creates the app)
         if (appWindowResizedFunc) {
+            EntryStackGuard guard(AppEntry::Event, "windowResized()");
             int w = sapp_width();
             int h = sapp_height();
             float dpiScale = sapp_dpi_scale();
-            float scale = pixelPerfectMode ? 1.0f : (1.0f / dpiScale);
+            float scale = pixelPerfectMode() ? 1.0f : (1.0f / dpiScale);
             appWindowResizedFunc(static_cast<int>(w * scale), static_cast<int>(h * scale));
         }
     }
 
-    inline bool frameReentryGuard = false;
+    inline bool frameReentryGuard = false;  // host-only: the frame callback's own guard
+
+    // Set the main window's delta time and update time for one update call.
+    // VSYNC and draw-synced updates report the measured wall time since the
+    // previous update call (#15). Fixed-Hz steps pass their nominal interval
+    // (fixedDelta > 0), so every step of a frame reports the same dt instead
+    // of the first one taking the whole gap (#228), and their nominal time on
+    // the loop's timeline (stepTime) as the update time Node timers count
+    // from, and whether this update is such a step. mainUpdateCallTime is
+    // kept current either way; a mode switch between updates moves it to the
+    // switch (restartLoopTiming).
+    inline void beginMainUpdateCall(double fixedDelta = 0.0,
+                                    std::chrono::steady_clock::time_point stepTime = {}) {
+        auto& wctx = mainWindowContext();
+        auto callNow = std::chrono::steady_clock::now();
+        if (fixedDelta > 0.0) {
+            wctx.updateDeltaTime = fixedDelta;
+        } else if (!wctx.mainUpdateCallTimeInitialized) {
+            wctx.updateDeltaTime = sapp_frame_duration(); // first frame: sokol's estimate
+        } else {
+            wctx.updateDeltaTime = std::chrono::duration<double>(callNow - wctx.mainUpdateCallTime).count();
+        }
+        wctx.mainUpdateCallTimeInitialized = true;
+        wctx.mainUpdateCallTime = callNow;
+        wctx.updateTime = (fixedDelta > 0.0) ? stepTime : callNow;
+        wctx.fixedStepUpdate = (fixedDelta > 0.0);
+    }
+
+    // One main-window update: timing (beginMainUpdateCall), then the app's
+    // update with the context marked as inside an update, so a Node timer
+    // created during it starts counting with the next update (tcNode.h).
+    // Each call is an entry point (#349): the stacks go back to their depth
+    // before it, in both modes (synced: mid-frame; independent: every VSYNC
+    // update and every fixed-Hz step, so an idle EVENT_DRIVEN draw can't let
+    // leaks pile up until the next frame).
+    inline void runMainUpdate(double fixedDelta = 0.0,
+                              std::chrono::steady_clock::time_point stepTime = {}) {
+        beginMainUpdateCall(fixedDelta, stepTime);
+        auto& wctx = mainWindowContext();
+        wctx.inUpdate = true;
+        if (appUpdateFunc) {
+            EntryStackGuard guard(AppEntry::Update);
+            appUpdateFunc();
+        }
+        wctx.inUpdate = false;
+    }
+
+    // Update processing of one main-loop frame when update is NOT synced to
+    // draw (setIndependentFps). Split out of _frame_cb so the stepping can be
+    // driven headless (core/tests/frameTiming).
+    //   VSYNC:        one update per frame, measured dt.
+    //   fixed Hz:     accumulator steps at the nominal 1/updateFps, at most
+    //                 getMaxUpdateSteps() per frame; time beyond the cap is
+    //                 dropped with a one-time warning (#228).
+    //   EVENT_DRIVEN: no update.
+    inline void runIndependentUpdates(std::chrono::steady_clock::time_point now) {
+        auto& wctx = mainWindowContext();
+        auto& loop = mainLoop();
+        if (loop.updateTargetFps == VSYNC) {
+            runMainUpdate();
+            recordUpdateRateSample(wctx, wctx.updateDeltaTime, 1.0);
+        } else if (loop.updateTargetFps > 0) {
+            if (!loop.lastUpdateTimeInitialized) {   // first frame, or just after a mode switch
+                loop.lastUpdateTime = now;
+                loop.lastUpdateTimeInitialized = true;
+            }
+            double updateInterval = 1.0 / loop.updateTargetFps;
+            double elapsed = std::chrono::duration<double>(now - loop.lastUpdateTime).count();
+            loop.lastUpdateTime = now;
+
+            FixedStepAdvance adv = advanceFixedStep(loop.updateAccumulator, elapsed, updateInterval,
+                                                    getMaxUpdateSteps());
+            if (adv.droppedTime > 0.0) {
+                warnUpdateStepsDropped(FixedStepLoop::Main, adv.droppedTime, updateInterval, adv.steps);
+            }
+            // The frame's steps are the latest adv.steps intervals on the
+            // loop's timeline, ending one leftover accumulator before `now`.
+            const double leftover = loop.updateAccumulator;
+            int ran = 0;
+            for (; ran < adv.steps; ++ran) {
+                // setFps()/setIndependentFps() from inside update(): the new
+                // mode starts next frame; don't finish this frame's old steps.
+                if (!loop.lastUpdateTimeInitialized) break;
+                double behind = leftover + (adv.steps - 1 - ran) * updateInterval;
+                auto stepTime = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                          std::chrono::duration<double>(behind));
+                runMainUpdate(updateInterval, stepTime);
+            }
+            // Measured rate (#228): the time the steps consumed, in steps
+            // (fractional: whole steps plus the accumulator's progress), over
+            // the wall time. Dropped time and steps cut short don't count.
+            double consumed = (elapsed - adv.droppedTime) / updateInterval - (adv.steps - ran);
+            recordUpdateRateSample(wctx, elapsed, consumed);
+        }
+    }
+
+    // Draw decision of one main-loop frame (before _frame_cb's capture
+    // override). Split out of _frame_cb so it can be driven headless.
+    //   VSYNC:        every frame.
+    //   fixed fps:    frame skipping; at most one draw per tick, with a
+    //                 half-tick tolerance so a target at or just above the
+    //                 display rate (setFps(60) on a 59.94 Hz display) draws
+    //                 every tick instead of skipping frames at irregular
+    //                 intervals (#228).
+    //   EVENT_DRIVEN: only on redraw().
+    inline bool mainLoopShouldDraw(std::chrono::steady_clock::time_point now) {
+        auto& loop = mainLoop();
+        if (!loop.lastDrawTimeInitialized) {   // first frame, or just after a mode switch
+            loop.lastDrawTime = now;
+            loop.lastDrawTimeInitialized = true;
+        }
+        if (loop.drawTargetFps == VSYNC) return true;
+        if (loop.drawTargetFps > 0) {
+            double drawInterval = 1.0 / loop.drawTargetFps;
+            double elapsed = std::chrono::duration<double>(now - loop.lastDrawTime).count();
+            loop.lastDrawTime = now;
+            return frameSkipShouldTick(loop.drawAccumulator, elapsed, drawInterval);
+        }
+        return loop.redrawCount > 0;
+    }
+
+    // One main-loop frame up to the draw decision (before _frame_cb's capture
+    // override): the frame's time sample, so getFrameElapsedTime() reads the
+    // same value in every update step and the draw of this frame; work queued
+    // for the main thread; the updates when update runs independently of draw
+    // (a draw-synced update runs with the draw, runSyncedUpdate). Returns
+    // whether this frame draws. Split out of _frame_cb so the whole sequence
+    // can be driven headless (core/tests/frameTiming).
+    inline bool beginMainLoopFrame(std::chrono::steady_clock::time_point now) {
+        sampleFrameTime(mainWindowContext());
+
+        {
+            // The queued work below runs app code: one entry point (#349).
+            EntryStackGuard guard(AppEntry::Prelude);
+
+            // Run work marshalled from worker threads (runOnMainThread, Event
+            // Deliver::Main). Done before update/draw so queued tree edits land
+            // while no traversal is in flight.
+            internal::drainMainThreadQueue();
+
+            // Log the dropped plays that could only be counted (off the main
+            // thread, or repeats inside the rate limit). Rate limited.
+            internal::pumpAudioDiagnostics();
+
+            // Process console input (fire events)
+            console::processQueue();
+
+            // Process MCP HTTP requests on main thread
+            #ifndef __EMSCRIPTEN__
+            mcp::processHttpQueue();
+            #endif
+        }
+
+        // Delta time is written into the main window's context; secondary
+        // windows measure their own delta in their tick (windowTick,
+        // core/platform).
+        if (!mainLoop().updateSyncedToDraw) {
+            runIndependentUpdates(now);
+        }
+
+        return mainLoopShouldDraw(now);
+    }
+
+    // The update of a drawn frame when update is synced to draw (setFps:
+    // VSYNC, a fixed rate or EVENT_DRIVEN): one update per drawn frame with
+    // the measured dt, and its getFrameRate() sample. _frame_cb runs it after
+    // beginFrame(). Split out so it can be driven headless.
+    inline void runSyncedUpdate() {
+        if (!mainLoop().updateSyncedToDraw || !appUpdateFunc) return;
+        runMainUpdate();
+        recordUpdateRateSample(mainWindowContext(), mainWindowContext().updateDeltaTime, 1.0);
+    }
 
     inline void _frame_cb() {
         // Guard against reentry (e.g. macOS modal dialogs pump the event loop)
         if (frameReentryGuard) return;
         frameReentryGuard = true;
 
-        auto now = std::chrono::high_resolution_clock::now();
+        // Frame time, queued work, independent updates and the draw decision.
+        bool shouldDraw = beginMainLoopFrame(std::chrono::steady_clock::now());
 
-        // Initialize timing
-        if (!lastUpdateTimeInitialized) {
-            lastUpdateTime = now;
-            lastUpdateTimeInitialized = true;
-        }
-        if (!lastDrawTimeInitialized) {
-            lastDrawTime = now;
-            lastDrawTimeInitialized = true;
-        }
-
-        // Process console input (fire events)
-        console::processQueue();
-
-        // Process MCP HTTP requests on main thread
-        #ifndef __EMSCRIPTEN__
-        mcp::processHttpQueue();
-        #endif
-
-        // Compute update delta time (actual elapsed since last update call)
-        auto computeUpdateDelta = [&]() {
-            if (!lastUpdateCallTimeInitialized) {
-                lastUpdateCallTimeInitialized = true;
-                lastUpdateCallTime = now;
-                updateDeltaTime = sapp_frame_duration(); // first frame: use sokol's estimate
-            } else {
-                auto callNow = std::chrono::high_resolution_clock::now();
-                updateDeltaTime = std::chrono::duration<double>(callNow - lastUpdateCallTime).count();
-                lastUpdateCallTime = callNow;
-            }
-        };
-
-        // --- Update Loop processing ---
-        if (updateSyncedToDraw) {
-            // Synced to Draw: handled with shouldDraw below
-        } else if (updateTargetFps == VSYNC) {
-            // VSYNC mode (independent): update every frame
-            computeUpdateDelta();
-            if (appUpdateFunc) appUpdateFunc();
-        } else if (updateTargetFps > 0) {
-            // Independent fixed Hz Update
-            double updateInterval = 1.0 / updateTargetFps;
-            double elapsed = std::chrono::duration<double>(now - lastUpdateTime).count();
-            updateAccumulator += elapsed;
-            lastUpdateTime = now;
-
-            while (updateAccumulator >= updateInterval) {
-                computeUpdateDelta();
-                if (appUpdateFunc) appUpdateFunc();
-                updateAccumulator -= updateInterval;
-            }
-        }
-        // If updateTargetFps == EVENT_DRIVEN (0), no Update (event-driven)
-
-        // --- Draw Loop processing ---
-        bool shouldDraw = false;
-
-        if (drawTargetFps == VSYNC) {
-            // VSync: draw every frame (sokol_app controls timing)
+        // Force a frame when a capture is pending so present()/afterFrame runs
+        // and the deferred screenshot (or MCP tc_get_screenshot) actually fires —
+        // otherwise a request arriving in a paused/event-driven app would never
+        // be served and a blocked MCP HTTP worker would hang.
+        if (!mainWindowContext().pendingScreenshotPaths.empty()
+            #ifndef __EMSCRIPTEN__
+            || mcp::hasDeferredResponses()
+            #endif
+        ) {
             shouldDraw = true;
-        } else if (drawTargetFps > 0) {
-            // Fixed FPS: controlled by frame skipping
-            double drawInterval = 1.0 / drawTargetFps;
-            double elapsed = std::chrono::duration<double>(now - lastDrawTime).count();
-            drawAccumulator += elapsed;
-            lastDrawTime = now;
-
-            if (drawAccumulator >= drawInterval) {
-                shouldDraw = true;
-                // Consume only one frame (draw once even if multiple frames accumulated)
-                drawAccumulator -= drawInterval;
-                // Prevent over-accumulation
-                if (drawAccumulator > drawInterval) {
-                    drawAccumulator = 0.0;
-                }
-            }
-        } else {
-            // EVENT_DRIVEN (0): draw only on redraw()
-            shouldDraw = (redrawCount > 0);
         }
 
         if (shouldDraw) {
             beginFrame();
 
             // If Update is synced to Draw, call Update here
-            if (updateSyncedToDraw && appUpdateFunc) {
-                computeUpdateDelta();
-                appUpdateFunc();
-            }
+            runSyncedUpdate();
 
             if (appDrawFunc) appDrawFunc();
 
@@ -2083,9 +2686,18 @@ namespace internal {
 
             present();
 
+            // After present(): swapchain committed, outside any pass. Safe point
+            // for end-of-frame readback (e.g. VideoRecorder auto-capture). Its
+            // listeners are app code: an entry point (#349).
+            {
+                EntryStackGuard guard(AppEntry::AfterFrame);
+                events().afterFrame.notify();
+            }
+
             // Decrement redrawCount (don't go below 0)
-            if (redrawCount > 0) {
-                redrawCount--;
+            auto& loop = mainLoop();
+            if (loop.redrawCount > 0) {
+                loop.redrawCount--;
             }
         } else {
             // Skip Present when not drawing (prevent double-buffer flickering)
@@ -2093,8 +2705,8 @@ namespace internal {
         }
 
         // Save previous frame's mouse position
-        pmouseX = mouseX;
-        pmouseY = mouseY;
+        internal::currentWindowContext().pmouseX = internal::currentWindowContext().mouseX;
+        internal::currentWindowContext().pmouseY = internal::currentWindowContext().mouseY;
 
         frameReentryGuard = false;
     }
@@ -2108,18 +2720,59 @@ namespace internal {
         // Stop console input thread
         console::stop();
 
-        if (appCleanupFunc) appCleanupFunc();
+        if (appCleanupFunc) {
+            EntryStackGuard guard(AppEntry::Exit);
+            appCleanupFunc();
+        }
+
+        // Stop the audio device explicitly: the AudioEngine singleton is
+        // intentionally leaked (see AudioEngine::getInstance()), so no
+        // exit-time destructor will do this. Runs after appCleanupFunc so
+        // the app's exit() can still use audio; shutdown() is a no-op when
+        // the engine was never initialized.
+        trussc::shutdownAudio();
+
         cleanup();
     }
 
+    // The name an event entry point (#349) gives in its warning, from the
+    // sapp event type: the App handler it reaches. `dragging`: a mouse move
+    // with a button held, delivered as mouseDragged(). Text only; every event
+    // shares AppEntry::Event's rate limit.
+    inline const char* eventEntryName(const sapp_event* ev, bool dragging) {
+        switch (ev->type) {
+            case SAPP_EVENTTYPE_KEY_DOWN:          return "keyPressed()";
+            case SAPP_EVENTTYPE_KEY_UP:            return "keyReleased()";
+            case SAPP_EVENTTYPE_MOUSE_DOWN:        return "mousePressed()";
+            case SAPP_EVENTTYPE_MOUSE_UP:          return "mouseReleased()";
+            case SAPP_EVENTTYPE_MOUSE_ENTER:
+            case SAPP_EVENTTYPE_MOUSE_MOVE:        return dragging ? "mouseDragged()" : "mouseMoved()";
+            case SAPP_EVENTTYPE_MOUSE_SCROLL:      return "mouseScrolled()";
+            case SAPP_EVENTTYPE_TOUCHES_BEGAN:     return "touchPressed()";
+            case SAPP_EVENTTYPE_TOUCHES_MOVED:     return "touchMoved()";
+            case SAPP_EVENTTYPE_TOUCHES_ENDED:
+            case SAPP_EVENTTYPE_TOUCHES_CANCELLED: return "touchReleased()";
+            case SAPP_EVENTTYPE_RESIZED:           return "windowResized()";
+            case SAPP_EVENTTYPE_FILES_DROPPED:     return "filesDropped()";
+            case SAPP_EVENTTYPE_CLIPBOARD_PASTED:  return "the clipboardPasted event";
+            case SAPP_EVENTTYPE_QUIT_REQUESTED:    return "the exitRequested event";
+            default:                               return "a rawEvent listener";
+        }
+    }
+
     inline void _event_cb(const sapp_event* ev) {
+        // Each event is an entry point (#349): the listeners, the App's
+        // handler and the Node handlers it reaches leave the stacks as they
+        // found them.
+        EntryStackGuard guard(AppEntry::Event, eventEntryName(ev, currentMouseButton >= 0));
+
         // Notify raw event listeners (used by addons like tcxImGui)
         events().rawEvent.notify(*ev);
 
         // ev->mouse_x/y arrive in framebuffer coordinates
-        // pixelPerfectMode = true: use as-is (coords = framebuffer size)
-        // pixelPerfectMode = false: divide by DPI scale to get logical coords
-        float scale = pixelPerfectMode ? 1.0f : (1.0f / sapp_dpi_scale());
+        // pixelPerfectMode() == true: use as-is (coords = framebuffer size)
+        // pixelPerfectMode() == false: divide by DPI scale to get logical coords
+        float scale = pixelPerfectMode() ? 1.0f : (1.0f / sapp_dpi_scale());
         bool hasModShift = (ev->modifiers & SAPP_MODIFIER_SHIFT) != 0;
         bool hasModCtrl = (ev->modifiers & SAPP_MODIFIER_CTRL) != 0;
         bool hasModAlt = (ev->modifiers & SAPP_MODIFIER_ALT) != 0;
@@ -2137,15 +2790,14 @@ namespace internal {
                 args.super = hasModSuper;
                 events().keyPressed.notify(args);
 
-                // Track key state
+                // Track key state (only on first press, not auto-repeat)
                 if (!ev->key_repeat) {
-                    keysPressed.insert(ev->key_code);
+                    internal::currentWindowContext().keysPressed.insert(ev->key_code);
                 }
 
-                // Legacy callback (for compatibility)
-                if (!ev->key_repeat && appKeyPressedFunc) {
-                    appKeyPressedFunc(ev->key_code);
-                }
+                // Forward to App / Node tree. Fire on auto-repeat too
+                // (args.isRepeat lets handlers filter if they don't want it).
+                if (appKeyPressedFunc) appKeyPressedFunc(args);
                 break;
             }
             case SAPP_EVENTTYPE_KEY_UP: {
@@ -2159,86 +2811,96 @@ namespace internal {
                 events().keyReleased.notify(args);
 
                 // Track key state
-                keysPressed.erase(ev->key_code);
+                internal::currentWindowContext().keysPressed.erase(ev->key_code);
 
-                if (appKeyReleasedFunc) appKeyReleasedFunc(ev->key_code);
+                if (appKeyReleasedFunc) appKeyReleasedFunc(args);
                 break;
             }
             case SAPP_EVENTTYPE_MOUSE_DOWN: {
                 currentMouseButton = ev->mouse_button;
-                mouseX = ev->mouse_x * scale;
-                mouseY = ev->mouse_y * scale;
-                mouseButton = ev->mouse_button;
-                mousePressed = true;
+                internal::currentWindowContext().mouseX = ev->mouse_x * scale;
+                internal::currentWindowContext().mouseY = ev->mouse_y * scale;
+                internal::currentWindowContext().mouseButton = ev->mouse_button;
+                internal::currentWindowContext().mousePressed = true;
 
+                // App-level args: no node transform, so pos == globalPos.
                 MouseEventArgs args;
-                args.x = mouseX;
-                args.y = mouseY;
+                args.pos = args.globalPos = Vec2(internal::currentWindowContext().mouseX, internal::currentWindowContext().mouseY);
                 args.button = ev->mouse_button;
                 args.shift = hasModShift;
                 args.ctrl = hasModCtrl;
                 args.alt = hasModAlt;
                 args.super = hasModSuper;
+                args.syncLegacy();
                 events().mousePressed.notify(args);
 
-                if (appMousePressedFunc) appMousePressedFunc((int)mouseX, (int)mouseY, ev->mouse_button);
+                if (appMousePressedFunc) appMousePressedFunc(args);
                 break;
             }
             case SAPP_EVENTTYPE_MOUSE_UP: {
                 currentMouseButton = -1;
-                mouseX = ev->mouse_x * scale;
-                mouseY = ev->mouse_y * scale;
-                mouseButton = -1;
-                mousePressed = false;
+                internal::currentWindowContext().mouseX = ev->mouse_x * scale;
+                internal::currentWindowContext().mouseY = ev->mouse_y * scale;
+                internal::currentWindowContext().mouseButton = -1;
+                internal::currentWindowContext().mousePressed = false;
 
                 MouseEventArgs args;
-                args.x = mouseX;
-                args.y = mouseY;
+                args.pos = args.globalPos = Vec2(internal::currentWindowContext().mouseX, internal::currentWindowContext().mouseY);
                 args.button = ev->mouse_button;
                 args.shift = hasModShift;
                 args.ctrl = hasModCtrl;
                 args.alt = hasModAlt;
                 args.super = hasModSuper;
+                args.syncLegacy();
                 events().mouseReleased.notify(args);
 
-                if (appMouseReleasedFunc) appMouseReleasedFunc((int)mouseX, (int)mouseY, ev->mouse_button);
+                if (appMouseReleasedFunc) appMouseReleasedFunc(args);
                 break;
             }
             case SAPP_EVENTTYPE_MOUSE_MOVE: {
-                float prevX = mouseX;
-                float prevY = mouseY;
-                mouseX = ev->mouse_x * scale;
-                mouseY = ev->mouse_y * scale;
+                float prevX = internal::currentWindowContext().mouseX;
+                float prevY = internal::currentWindowContext().mouseY;
+                internal::currentWindowContext().mouseX = ev->mouse_x * scale;
+                internal::currentWindowContext().mouseY = ev->mouse_y * scale;
+
+                // Rich carrier (internal::MouseEventRaw); the per-kind public type is
+                // built from it at the boundary (internal::toDragArgs / internal::toMoveArgs).
+                internal::MouseEventRaw args;
+                args.pos = args.globalPos = Vec2(internal::currentWindowContext().mouseX, internal::currentWindowContext().mouseY);
+                args.delta = args.globalDelta = Vec2(internal::currentWindowContext().mouseX - prevX, internal::currentWindowContext().mouseY - prevY);
+                args.shift = hasModShift;
+                args.ctrl = hasModCtrl;
+                args.alt = hasModAlt;
+                args.super = hasModSuper;
 
                 if (currentMouseButton >= 0) {
-                    MouseDragEventArgs args;
-                    args.x = mouseX;
-                    args.y = mouseY;
-                    args.deltaX = mouseX - prevX;
-                    args.deltaY = mouseY - prevY;
                     args.button = currentMouseButton;
-                    events().mouseDragged.notify(args);
-
-                    if (appMouseDraggedFunc) appMouseDraggedFunc((int)mouseX, (int)mouseY, currentMouseButton);
+                    MouseDragEventArgs dragArgs = internal::toDragArgs(args);
+                    events().mouseDragged.notify(dragArgs);
+                    // The public typed arg carries `consumed`; copy it back to the
+                    // raw carrier so handleMouseDragged can gate the tree dispatch.
+                    args.consumed = dragArgs.consumed;
+                    if (appMouseDraggedFunc) appMouseDraggedFunc(args);
                 } else {
-                    MouseMoveEventArgs args;
-                    args.x = mouseX;
-                    args.y = mouseY;
-                    args.deltaX = mouseX - prevX;
-                    args.deltaY = mouseY - prevY;
-                    events().mouseMoved.notify(args);
-
-                    if (appMouseMovedFunc) appMouseMovedFunc((int)mouseX, (int)mouseY);
+                    MouseMoveEventArgs moveArgs = internal::toMoveArgs(args);
+                    events().mouseMoved.notify(moveArgs);
+                    args.consumed = moveArgs.consumed;
+                    if (appMouseMovedFunc) appMouseMovedFunc(args);
                 }
                 break;
             }
             case SAPP_EVENTTYPE_MOUSE_SCROLL: {
                 ScrollEventArgs args;
-                args.scrollX = ev->scroll_x;
-                args.scrollY = ev->scroll_y;
+                args.pos = args.globalPos = Vec2(internal::currentWindowContext().mouseX, internal::currentWindowContext().mouseY);
+                args.scroll = Vec2(ev->scroll_x, ev->scroll_y);
+                args.shift = hasModShift;
+                args.ctrl = hasModCtrl;
+                args.alt = hasModAlt;
+                args.super = hasModSuper;
+                args.syncLegacy();
                 events().mouseScrolled.notify(args);
 
-                if (appMouseScrolledFunc) appMouseScrolledFunc(ev->scroll_x, ev->scroll_y);
+                if (appMouseScrolledFunc) appMouseScrolledFunc(args);
                 break;
             }
             // Touch events (Android/iOS)
@@ -2269,40 +2931,46 @@ namespace internal {
                 }
 
                 // Touch-as-mouse: map first touch to mouse events
-                if (touchAsMouse && touchArgs.numTouches > 0) {
+                if (touchAsMouse() && touchArgs.numTouches > 0) {
                     float tx = touchArgs.touches[0].x;
                     float ty = touchArgs.touches[0].y;
 
                     if (ev->type == SAPP_EVENTTYPE_TOUCHES_BEGAN) {
                         currentMouseButton = 0;
-                        mouseX = tx; mouseY = ty;
-                        mouseButton = 0;
-                        mousePressed = true;
+                        internal::currentWindowContext().mouseX = tx; internal::currentWindowContext().mouseY = ty;
+                        internal::currentWindowContext().mouseButton = 0;
+                        internal::currentWindowContext().mousePressed = true;
 
                         MouseEventArgs margs;
-                        margs.x = tx; margs.y = ty; margs.button = 0;
+                        margs.pos = margs.globalPos = Vec2(tx, ty);
+                        margs.button = MOUSE_BUTTON_LEFT;
+                        margs.syncLegacy();
                         events().mousePressed.notify(margs);
-                        if (appMousePressedFunc) appMousePressedFunc((int)tx, (int)ty, 0);
+                        if (appMousePressedFunc) appMousePressedFunc(margs);
                     } else if (ev->type == SAPP_EVENTTYPE_TOUCHES_MOVED) {
-                        float prevX = mouseX, prevY = mouseY;
-                        mouseX = tx; mouseY = ty;
+                        float prevX = internal::currentWindowContext().mouseX, prevY = internal::currentWindowContext().mouseY;
+                        internal::currentWindowContext().mouseX = tx; internal::currentWindowContext().mouseY = ty;
 
-                        MouseDragEventArgs margs;
-                        margs.x = tx; margs.y = ty;
-                        margs.deltaX = tx - prevX; margs.deltaY = ty - prevY;
-                        margs.button = 0;
-                        events().mouseDragged.notify(margs);
-                        if (appMouseDraggedFunc) appMouseDraggedFunc((int)tx, (int)ty, 0);
+                        internal::MouseEventRaw margs;
+                        margs.pos = margs.globalPos = Vec2(tx, ty);
+                        margs.delta = margs.globalDelta = Vec2(tx - prevX, ty - prevY);
+                        margs.button = MOUSE_BUTTON_LEFT;
+                        MouseDragEventArgs dragArgs = internal::toDragArgs(margs);
+                        events().mouseDragged.notify(dragArgs);
+                        margs.consumed = dragArgs.consumed;
+                        if (appMouseDraggedFunc) appMouseDraggedFunc(margs);
                     } else {
                         currentMouseButton = -1;
-                        mouseX = tx; mouseY = ty;
-                        mouseButton = -1;
-                        mousePressed = false;
+                        internal::currentWindowContext().mouseX = tx; internal::currentWindowContext().mouseY = ty;
+                        internal::currentWindowContext().mouseButton = -1;
+                        internal::currentWindowContext().mousePressed = false;
 
                         MouseEventArgs margs;
-                        margs.x = tx; margs.y = ty; margs.button = 0;
+                        margs.pos = margs.globalPos = Vec2(tx, ty);
+                        margs.button = MOUSE_BUTTON_LEFT;
+                        margs.syncLegacy();
                         events().mouseReleased.notify(margs);
-                        if (appMouseReleasedFunc) appMouseReleasedFunc((int)tx, (int)ty, 0);
+                        if (appMouseReleasedFunc) appMouseReleasedFunc(margs);
                     }
                 }
                 break;
@@ -2326,8 +2994,8 @@ namespace internal {
             }
             case SAPP_EVENTTYPE_FILES_DROPPED: {
                 DragDropEventArgs args;
-                args.x = mouseX;  // Last mouse position
-                args.y = mouseY;
+                args.x = internal::currentWindowContext().mouseX;  // Last mouse position
+                args.y = internal::currentWindowContext().mouseY;
                 int numFiles = sapp_get_num_dropped_files();
                 for (int i = 0; i < numFiles; i++) {
                     args.files.push_back(sapp_get_dropped_file_path(i));
@@ -2335,6 +3003,14 @@ namespace internal {
                 events().filesDropped.notify(args);
 
                 if (appFilesDroppedFunc) appFilesDroppedFunc(args.files);
+                break;
+            }
+            case SAPP_EVENTTYPE_CLIPBOARD_PASTED: {
+                // Read the clipboard now — on Web this is the only moment the
+                // content is reliably available. App-level only (no Node dispatch).
+                ClipboardPastedEventArgs args;
+                args.text = getClipboardString();
+                events().clipboardPasted.notify(args);
                 break;
             }
             case SAPP_EVENTTYPE_QUIT_REQUESTED: {
@@ -2361,22 +3037,33 @@ namespace internal {
 template<typename AppClass>
 sapp_desc buildAppDescriptor(const WindowSettings& settings = WindowSettings()) {
     // Set pixel perfect mode
-    internal::pixelPerfectMode = settings.pixelPerfect;
+    internal::pixelPerfectMode() = settings.pixelPerfect;
+
+    // Remember the requested decoration; applied after the window is created.
+    internal::windowDecorated = settings.decorated;
+
+    // Per-frame uniform reservation for sg_setup (consumed in internal::setup()).
+    internal::gpuUniformBufferReserve = settings.uniformBufferReserve;
 
     // Create app instance (shared_ptrで管理してNodeのweak_from_thisを有効にする)
+    // Host-only, so a per-module copy is fine: a hot reload build launches
+    // through runHotReloadApp instead, which never instantiates this.
     static std::shared_ptr<AppClass> app = nullptr;
 
     // Set callbacks
     internal::appSetupFunc = []() {
         app = std::make_shared<AppClass>();
+        // The main window's scene-graph root (getRootNode()), held weakly
+        internal::mainWindowContext().rootNode = app;
         // Note: Size is set in _setup_cb after this callback
-        // setup() is called automatically in updateTree() via setupCalled_ flag
+        // setup() is called automatically in updateTree() via setupCalled_ flag,
+        // and the App's audioOut() / audioIn() are subscribed right after it
     };
     internal::appUpdateFunc = []() {
         internal::updateFrameCount++;  // Update frame count
         events().update.notify();
         if (app) {
-            app->handleUpdate(internal::mouseX, internal::mouseY);
+            app->handleUpdate(internal::currentWindowContext().mouseX, internal::currentWindowContext().mouseY);
         }
     };
     internal::appDrawFunc = []() {
@@ -2388,32 +3075,36 @@ sapp_desc buildAppDescriptor(const WindowSettings& settings = WindowSettings()) 
             events().exit.notify();
             app->exit();
             app->cleanup();
+            // The audio device is still running (it stops in _cleanup_cb, so
+            // exit() can use audio): detach the App's audio hooks and wait
+            // for a callback in flight before the App goes (#256).
+            internal::detachAppAudio(*app);
             app.reset();
         }
     };
     // NOTE: events().xxx.notify() is already called in the sokol event handler
     // above (with full modifier info). These legacy callbacks only forward to
     // the App subclass methods — do NOT re-notify events here.
-    internal::appKeyPressedFunc = [](int key) {
-        if (app) app->handleKeyPressed(key);
+    internal::appKeyPressedFunc = [](const KeyEventArgs& e) {
+        if (app) app->handleKeyPressed(e);
     };
-    internal::appKeyReleasedFunc = [](int key) {
-        if (app) app->handleKeyReleased(key);
+    internal::appKeyReleasedFunc = [](const KeyEventArgs& e) {
+        if (app) app->handleKeyReleased(e);
     };
-    internal::appMousePressedFunc = [](int x, int y, int button) {
-        if (app) app->handleMousePressed(x, y, button);
+    internal::appMousePressedFunc = [](const MouseEventArgs& e) {
+        if (app) app->handleMousePressed(e);
     };
-    internal::appMouseReleasedFunc = [](int x, int y, int button) {
-        if (app) app->handleMouseReleased(x, y, button);
+    internal::appMouseReleasedFunc = [](const MouseEventArgs& e) {
+        if (app) app->handleMouseReleased(e);
     };
-    internal::appMouseMovedFunc = [](int x, int y) {
-        if (app) app->handleMouseMoved(x, y);
+    internal::appMouseMovedFunc = [](const internal::MouseEventRaw& e) {
+        if (app) app->handleMouseMoved(e);
     };
-    internal::appMouseDraggedFunc = [](int x, int y, int button) {
-        if (app) app->handleMouseDragged(x, y, button);
+    internal::appMouseDraggedFunc = [](const internal::MouseEventRaw& e) {
+        if (app) app->handleMouseDragged(e);
     };
-    internal::appMouseScrolledFunc = [](float dx, float dy) {
-        if (app) app->handleMouseScrolled(dx, dy, internal::mouseX, internal::mouseY);
+    internal::appMouseScrolledFunc = [](const ScrollEventArgs& e) {
+        if (app) app->handleMouseScrolled(e);
     };
     internal::appWindowResizedFunc = [](int w, int h) {
         if (app) app->handleWindowResized(w, h);
@@ -2454,7 +3145,7 @@ sapp_desc buildAppDescriptor(const WindowSettings& settings = WindowSettings()) 
     desc.frame_cb = internal::_frame_cb;
     desc.cleanup_cb = internal::_cleanup_cb;
     desc.event_cb = internal::_event_cb;
-    desc.logger.func = slog_func;
+    desc.logger.func = internal::sokolLog;
 
     // Enable drag and drop
     desc.enable_dragndrop = true;
@@ -2464,21 +3155,72 @@ sapp_desc buildAppDescriptor(const WindowSettings& settings = WindowSettings()) 
     // Enable clipboard
     desc.enable_clipboard = true;
     desc.clipboard_size = settings.clipboardSize;
-    internal::clipboardSize = settings.clipboardSize;
+    internal::currentWindowContext().clipboardSize = settings.clipboardSize;
+
+    // Windows: switch the console output code page to UTF-8 while the app
+    // runs, so UTF-8 log text is not shown in the OEM code page. Takes effect
+    // whenever the process has a console (Debug builds, TRUSSC_SHOW_CONSOLE);
+    // a GUI-subsystem Release build has none, and the call does nothing.
+    // sokol restores the previous code page when sapp_run() returns, and
+    // internal::ConsoleOutputCPCtrlGuard when Ctrl+C, Ctrl+Break or closing
+    // the console ends the process. std::exit(), abort(), an uncaught
+    // exception and a crash leave the console in UTF-8. Ignored on other
+    // platforms.
+    desc.win32.console_utf8 = true;
 
     return desc;
 }
+
+#ifdef _WIN32
+namespace internal {
+// sokol switches the console output code page to UTF-8 (console_utf8 above)
+// and puts it back when sapp_run() returns. Ctrl+C, Ctrl+Break and closing
+// the console end the process in the default console handler (ExitProcess)
+// instead, which would leave the launching cmd in UTF-8. This handler puts
+// the code page back first and returns FALSE, so the default handling goes
+// on and the process still ends.
+// Host-only state (tools/header_state_allowlist.txt): only the guard around
+// sapp_run() in runApp() / the hot reload host and its handler touch it, and
+// both are compiled into the host, so a guest's copy is never used.
+inline UINT consoleOutputCPBeforeRun = 0;   // 0: the process has no console
+
+inline BOOL WINAPI restoreConsoleOutputCPOnCtrl(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+        SetConsoleOutputCP(consoleOutputCPBeforeRun);
+    }
+    return FALSE;
+}
+
+// Installs restoreConsoleOutputCPOnCtrl for its lifetime (around sapp_run()),
+// with the code page the console has before sokol changes it.
+struct ConsoleOutputCPCtrlGuard {
+    ConsoleOutputCPCtrlGuard() {
+        consoleOutputCPBeforeRun = GetConsoleOutputCP();
+        installed = consoleOutputCPBeforeRun != 0 &&
+                    SetConsoleCtrlHandler(restoreConsoleOutputCPOnCtrl, TRUE) != 0;
+    }
+    ~ConsoleOutputCPCtrlGuard() {
+        if (installed) SetConsoleCtrlHandler(restoreConsoleOutputCPOnCtrl, FALSE);
+    }
+    ConsoleOutputCPCtrlGuard(const ConsoleOutputCPCtrlGuard&) = delete;
+    ConsoleOutputCPCtrlGuard& operator=(const ConsoleOutputCPCtrlGuard&) = delete;
+
+    bool installed = false;
+};
+} // namespace internal
+#endif
 
 // Desktop: build descriptor and run the event loop.
 // Android: sokol handles the event loop via ANativeActivity_onCreate → sokol_main().
 //          runApp() just stores the descriptor for sokol_main() to retrieve.
 #ifdef __ANDROID__
 namespace internal {
-    inline sapp_desc g_androidDesc = {};
+    inline sapp_desc g_androidDesc = {};  // Android only: no hot reload there
 }
 
 template<typename AppClass>
 int runApp(const WindowSettings& settings = WindowSettings()) {
+    internal::openEnvLogFile();   // before sokol starts the app
     internal::g_androidDesc = buildAppDescriptor<AppClass>(settings);
     // On Android, sokol_main() will return g_androidDesc.
     // runApp() is called from sokol_main() context, so just return.
@@ -2487,7 +3229,11 @@ int runApp(const WindowSettings& settings = WindowSettings()) {
 #else
 template<typename AppClass>
 int runApp(const WindowSettings& settings = WindowSettings()) {
+    internal::openEnvLogFile();   // before sapp_run(): init-time failures too
     sapp_desc desc = buildAppDescriptor<AppClass>(settings);
+#ifdef _WIN32
+    internal::ConsoleOutputCPCtrlGuard consoleCtrl;   // Ctrl+C restores the console code page
+#endif
     sapp_run(&desc);
     return 0;
 }
@@ -2535,6 +3281,11 @@ inline void bindCursorImage(Cursor cursor, const Image& image,
 // so PbrPipeline::drawMesh() can call Environment methods by value)
 #include "tc/3d/tcEnvironment.h"
 
+// TrussC GPU point-splat pipeline (defines Mesh::drawGpuPoints() out-of-class).
+// Must come before the PBR pipeline: flushFboDeferredPbr() replays the deferred
+// point draws within the shared FBO layer walk.
+#include "tc/3d/tcMeshPointPipeline.h"
+
 // TrussC PBR mesh pipeline (defines Mesh::drawGpuPbr() out-of-class)
 #include "tc/3d/tcMeshPbrPipeline.h"
 
@@ -2557,6 +3308,9 @@ inline void bindCursorImage(Cursor cursor, const Image& image,
 
 // TrussC video playback
 #include "tc/video/tcVideoPlayer.h"
+
+// TrussC video recording (native encoder, no ffmpeg)
+#include "tc/video/tcVideoRecorder.h"
 
 // TrussC 3D primitives
 #include <map>
@@ -2649,6 +3403,7 @@ inline void drawCone(float x, float y, float z, float radius, float height, int 
 #include "tc/network/tcUdpSocket.h"
 #include "tc/network/tcTcpClient.h"
 #include "tc/network/tcTcpServer.h"
+#include "tc/network/tcNetworkInterface.h"
 
 // TrussC serial communication
 #include "tc/comm/tcSerial.h"
@@ -2656,6 +3411,7 @@ inline void drawCone(float x, float y, float z, float radius, float height, int 
 // TrussC sound
 #include "tc/sound/tcSound.h"
 #include "tc/sound/tcChipSound.h"
+#include "tc/sound/tcAudioRecorder.h"
 
 // TrussC threading
 #include "tc/utils/tcThread.h"
@@ -2731,6 +3487,9 @@ namespace tc = trussc;
 // Users should add these in their code:
 //   using namespace std;
 //   using namespace tc;
+
+// Secondary windows (multi-window; needs Node/CoreEvents/WindowSettings above)
+#include "tc/app/tcWindow.h"
 
 // TrussC standard MCP tools (included last to resolve dependencies)
 #include "tc/utils/tcStandardTools.h"

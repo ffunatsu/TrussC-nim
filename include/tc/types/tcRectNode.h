@@ -56,10 +56,22 @@ public:
         setSize(size, size);
     }
 
+    void setSize(const Vec2& s) {
+        setSize(s.x, s.y);
+    }
+
     // Set position and size at once
     void setRect(float x, float y, float w, float h) {
         setPos(x, y);
         setSize(w, h);
+    }
+
+    // -------------------------------------------------------------------------
+    // Reflection
+    // -------------------------------------------------------------------------
+    TC_REFLECT(RectNode, Node) {
+        TC_VALUE(size, getSize, setSize)
+        TC_VALUE(clipping, isClipping, setClipping)
     }
 
     // -------------------------------------------------------------------------
@@ -98,16 +110,15 @@ public:
         }
 
         // Calculate intersection with Z=0 plane
-        float t;
-        Vec3 hitPoint;
-        if (!localRay.intersectZPlane(t, hitPoint)) {
+        const Ray::Hit h = localRay.intersectZPlane();
+        if (!h.hit) {
             return false;
         }
 
         // Check if intersection point is within rectangle
-        if (hitPoint.x >= 0 && hitPoint.x <= width_ &&
-            hitPoint.y >= 0 && hitPoint.y <= height_) {
-            outDistance = t;
+        if (h.point.x >= 0 && h.point.x <= width_ &&
+            h.point.y >= 0 && h.point.y <= height_) {
+            outDistance = h.t;
             return true;
         }
 
@@ -129,24 +140,32 @@ public:
     // receiving events through overlapping siblings)
     // -------------------------------------------------------------------------
 
-    HitResult findHitNodeRecursive(const Ray& globalRay, const Mat4& parentInverseMatrix) override {
+    HitResult findHitNodeRecursive(internal::PickRaySource& pick,
+                                   const CameraContext* inheritedCtx,
+                                   Ray globalRay,
+                                   const Mat4& parentInverseMatrix) override {
         if (!isActive() || !isVisible()) return HitResult{};
 
         if (clipping_) {
-            // Pre-check: ray must hit this rect before we check children
-            Mat4 localInverse = getLocalMatrix().inverted();
+            // Pre-check: ray must hit this rect before we check children.
+            // Use this node's effective camera context, same as the base does.
+            auto [ctx, ray] = resolvePickRay(pick, inheritedCtx, globalRay);
+            (void)ctx;
+            // Degenerate local matrix (an axis scaled to 0): no area, so
+            // nothing in this subtree can be hit.
+            Mat4 localInverse;
+            if (!getLocalMatrix().tryInvert(localInverse)) return HitResult{};
             Mat4 globalInverse = localInverse * parentInverseMatrix;
-            Ray localRay = globalRay.transformed(globalInverse);
+            Ray localRay = ray.transformed(globalInverse);
 
-            float t;
-            Vec3 hp;
-            if (!localRay.intersectZPlane(t, hp) ||
-                hp.x < 0 || hp.x > width_ || hp.y < 0 || hp.y > height_) {
+            const Ray::Hit h = localRay.intersectZPlane();
+            if (!h.hit ||
+                h.point.x < 0 || h.point.x > width_ || h.point.y < 0 || h.point.y > height_) {
                 return HitResult{};
             }
         }
 
-        return Node::findHitNodeRecursive(globalRay, parentInverseMatrix);
+        return Node::findHitNodeRecursive(pick, inheritedCtx, globalRay, parentInverseMatrix);
     }
 
     // -------------------------------------------------------------------------
@@ -172,7 +191,7 @@ protected:
             float gx1 = g1.x, gy1 = g1.y, gx2 = g2.x, gy2 = g2.y;
 
             // Calculate rectangle in screen coordinates (considering DPI scale)
-            float dpi = sapp_dpi_scale();
+            float dpi = getDpiScale();
             float sx = std::min(gx1, gx2) * dpi;
             float sy = std::min(gy1, gy2) * dpi;
             float sw = std::abs(gx2 - gx1) * dpi;
@@ -192,45 +211,50 @@ protected:
     // Mouse events (fire events)
     // -------------------------------------------------------------------------
 
-    bool onMousePress(Vec2 local, int button) override {
-        MouseEventArgs args;
-        args.x = local.x;
-        args.y = local.y;
-        args.button = button;
+    // These override the rich form and fire the corresponding Event. They also
+    // forward to the simple (Vec2,int) virtual so that a subclass which overrode
+    // the legacy simple form (pre-rich, oF-style) still gets called.
+    //
+    // Propagation: press/release/move/scroll all BUBBLE (v0.7) — returning
+    // false hands the event to the parent chain. RectNode consumes
+    // press/release/drag by default (return true); override and return false
+    // to let an ancestor (e.g. a draggable panel behind this label) take the
+    // gesture. The press consumer becomes the grab target for drag/release.
+    bool onMousePress(const MouseEventArgs& e) override {
+        MouseEventArgs args = e;  // already localized to this node
         mousePressed.notify(args);
-        return true;  // Consume event
+        onMousePress(e.pos, e.button);  // legacy subclass hook
+        return true;  // Consume event (return false to bubble to parent)
     }
 
-    bool onMouseRelease(Vec2 local, int button) override {
-        MouseEventArgs args;
-        args.x = local.x;
-        args.y = local.y;
-        args.button = button;
+    bool onMouseRelease(const MouseEventArgs& e) override {
+        MouseEventArgs args = e;
         mouseReleased.notify(args);
+        onMouseRelease(e.pos, e.button);  // legacy subclass hook
         return true;
     }
 
-    bool onMouseDrag(Vec2 local, int button) override {
-        MouseDragEventArgs args;
-        args.x = local.x;
-        args.y = local.y;
-        args.button = button;
-        args.deltaX = local.x - getMouseX();  // Simple delta
-        args.deltaY = local.y - getMouseY();
+    bool onMouseDrag(const MouseDragEventArgs& e) override {
+        MouseDragEventArgs args = e;
         mouseDragged.notify(args);
+        onMouseDrag(e.pos, e.button);  // legacy subclass hook
         return true;
     }
 
-    bool onMouseScroll(Vec2 local, Vec2 scroll) override {
-        (void)local;
-        ScrollEventArgs args;
-        args.scrollX = scroll.x;
-        args.scrollY = scroll.y;
+    bool onMouseScroll(const ScrollEventArgs& e) override {
+        ScrollEventArgs args = e;
         mouseScrolled.notify(args);
-        // Return false to allow bubbling to parent (e.g., ScrollContainer)
-        // Override and return true to consume the event
-        return false;
+        // Return false to allow bubbling to parent (e.g., ScrollContainer).
+        // The legacy hook may return true to consume.
+        return onMouseScroll(e.pos, e.scroll);
     }
+
+    // Bring the simple-form overloads into scope so the same-named rich
+    // overrides above don't hide them (name hiding across overload sets).
+    using Node::onMousePress;
+    using Node::onMouseRelease;
+    using Node::onMouseDrag;
+    using Node::onMouseScroll;
 
     // -------------------------------------------------------------------------
     // Drawing helpers
@@ -309,14 +333,14 @@ public:
     }
 
 protected:
-    bool onMousePress(Vec2 local, int button) override {
+    bool onMousePress(const MouseEventArgs& e) override {
         isPressed_ = true;
-        return RectNode::onMousePress(local, button);  // Also fire parent's event
+        return RectNode::onMousePress(e);  // Also fire parent's event
     }
 
-    bool onMouseRelease(Vec2 local, int button) override {
+    bool onMouseRelease(const MouseEventArgs& e) override {
         isPressed_ = false;
-        return RectNode::onMouseRelease(local, button);
+        return RectNode::onMouseRelease(e);
     }
 
 private:

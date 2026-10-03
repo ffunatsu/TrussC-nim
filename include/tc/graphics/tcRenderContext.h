@@ -9,12 +9,12 @@
 //
 // Usage:
 //   // Global functions (same as before)
-//   setColor(255, 0, 0);
+//   setColor(1.0, 0.0, 0.0);
 //   drawRect(10, 10, 100, 100);
 //
 //   // Explicit context (for future use)
 //   auto& ctx = getDefaultContext();
-//   ctx.setColor(255, 0, 0);
+//   ctx.setColor(1.0, 0.0, 0.0);
 //   ctx.drawRect(10, 10, 100, 100);
 //
 // =============================================================================
@@ -22,8 +22,12 @@
 // This file is included from TrussC.h, so required headers
 // are already included: tcMath.h, tcColor.h, tcBitmapFont.h, sokol_gl.h
 
+#include "tc/graphics/tcCurveTessellation.h"
+#include "tc/utils/tcTypeName.h"
+
 #include <vector>
 #include <string>
+#include <chrono>
 
 namespace trussc {
 
@@ -42,29 +46,57 @@ enum class StrokeJoin {
     Bevel    // Flat cut corners
 };
 
-// Forward declarations
-namespace internal {
-    extern sg_view fontView;
-    extern sg_sampler fontSampler;
-    extern sgl_pipeline fontPipeline;
-    extern bool fontInitialized;
-    extern sgl_pipeline pipeline3d;
-    extern bool pipeline3dInitialized;
-    extern bool pixelPerfectMode;
-    // Current screen setup state (for 2D drawing in perspective mode)
-    extern float currentScreenFov;
-    extern float currentViewW;
-    extern float currentViewH;
-    extern float currentCameraDist;
+// How points are rasterized (drawPoint() and Mesh in PrimitiveMode::Points).
+// Square/Round go through the GPU instanced splat (size-controllable, retained
+// VBO for a Mesh); Pixel is the classic 1px immediate point (like drawLine).
+enum class PointStyle {
+    Square,  // solid billboarded quad — lightest, default
+    Round,   // anti-aliased disc (alpha-to-coverage)
+    Pixel    // true 1px point (sokol_gl immediate; ignores pointSize)
+};
 
-    // View/Projection matrix tracking (for worldToScreen/screenToWorld)
-    extern Mat4 currentViewMatrix;
-    extern Mat4 currentProjectionMatrix;
-}
+// The bitmap-font state (internal::bitmapFontAtlas()) and pixelPerfectMode()
+// are declared in TrussC.h before this header is included. Screen setup /
+// view-projection tracking state lives in WindowContext
+// (tc/app/tcWindowContext.h, also included before this header from TrussC.h).
 
 // ---------------------------------------------------------------------------
 // RenderContext class
 // ---------------------------------------------------------------------------
+// RenderContext (and getDefaultContext) live in internal:: — the public drawing
+// API is the free functions that wrap them. A compat `using` below keeps the
+// names reachable from trussc:: for those wrappers and advanced users.
+namespace internal {
+
+// Entry points where TrussC calls app code (#349). Each value gives its label
+// in the unbalanced push/pop warnings (appEntryLabel) and its own rate limit,
+// so one value names the entry point everywhere. Wrapped by EntryStackGuard
+// (below), except Draw, whose frame-end reset is present()'s.
+enum class AppEntry {
+    Setup,    // the App's (or a secondary window root's) setup(), and the App's construction
+    Prelude,  // per-frame queues before update: runOnMainThread / Deliver::Main, console, MCP
+    Update,   // update(): synced, independent (VSYNC / each fixed-Hz step), headless, secondary windows
+    Draw,     // the frame: draw(), dropped at present() (#232)
+    Event,    // one window event (key, mouse, touch, drop, resize, ...), main or secondary
+    Exit,     // exit() and cleanup()
+    AfterFrame,  // events().afterFrame listeners, after present(), main or secondary
+    Count
+};
+
+inline const char* appEntryLabel(AppEntry e) {
+    switch (e) {
+        case AppEntry::Setup:   return "setup()";
+        case AppEntry::Prelude: return "the main-thread queue (runOnMainThread / Deliver::Main / console / MCP)";
+        case AppEntry::Update:  return "update()";
+        case AppEntry::Draw:    return "draw()";
+        case AppEntry::Event:   return "an event handler";
+        case AppEntry::Exit:    return "exit()";
+        case AppEntry::AfterFrame: return "an afterFrame listener";
+        case AppEntry::Count:   break;
+    }
+    return "?";
+}
+
 class RenderContext {
 public:
     // -----------------------------------------------------------------------
@@ -146,17 +178,98 @@ public:
     void setStrokeCap(StrokeCap cap) { style_.strokeCap = cap; }
     void setStrokeJoin(StrokeJoin join) { style_.strokeJoin = join; }
 
+    // Point drawing state (size in logical pixels, matching strokeWeight).
+    void setPointSize(float px) { style_.pointSize = px; }
+    void setPointStyle(PointStyle s) { style_.pointStyle = s; }
+
     bool isFillEnabled() const { return fillEnabled_; }
     bool isStrokeEnabled() const { return strokeEnabled_; }
     float getStrokeWeight() const { return strokeWeight_; }
     StrokeCap getStrokeCap() const { return style_.strokeCap; }
     StrokeJoin getStrokeJoin() const { return style_.strokeJoin; }
+    float getPointSize() const { return style_.pointSize; }
+    PointStyle getPointStyle() const { return style_.pointStyle; }
 
     // -----------------------------------------------------------------------
-    // Circle resolution
+    // Curve quality (circles, arcs, beziers, rounded rects, squircle)
     // -----------------------------------------------------------------------
+    //
+    // Two modes share the same Style.curve field:
+    //
+    //   Tolerance (default): pick segment count adaptively so the chord
+    //     stays within `pixels` of the true curve, in screen space. Set
+    //     once with setCurveTolerance(); zoom & scale() are accounted for
+    //     via getScale().
+    //
+    //   Resolution: use a fixed segment count regardless of radius. Useful
+    //     for intentionally chunky styling, or to bound vertex cost on
+    //     thousands of small circles.
+    //
+    // setCircleResolution() stays as a deprecated alias forwarding to
+    // setCurveResolution(); existing apps keep building, with a warning
+    // pointing at the new name.
 
-    void setCircleResolution(int res) { circleResolution_ = res; }
+    void setCurveTolerance(float pixels) {
+        style_.curve.mode = CurveStyle::Mode::Tolerance;
+        style_.curve.tolerance = pixels;
+    }
+    void setCurveResolution(int n) {
+        style_.curve.mode = CurveStyle::Mode::Resolution;
+        style_.curve.resolution = n;
+    }
+    float getCurveTolerance() const { return style_.curve.tolerance; }
+    int   getCurveResolution() const { return style_.curve.resolution; }
+    CurveStyle::Mode getCurveMode() const { return style_.curve.mode; }
+
+    // Effective uniform scale derived from the current modelView matrix.
+    // Used by tolerance mode to convert "0.1 px on screen" (the default)
+    // into the local tolerance the tessellator should aim for. Camera
+    // projection (perspective) is intentionally NOT considered — for
+    // creative-coding use most rendering is 2D or orthographic, and
+    // accounting for perspective would require per-pixel jacobian inversion
+    // at every curve point (overkill).
+    float getScale() const {
+        const auto& m = currentMatrix_.m;
+        // Column 0 / column 1 lengths = effective x / y scale of the basis.
+        float sx = std::sqrt(m[0]*m[0] + m[4]*m[4] + m[8]*m[8]);
+        float sy = std::sqrt(m[1]*m[1] + m[5]*m[5] + m[9]*m[9]);
+        float s = std::max(sx, sy);
+        return s > 0.0f ? s : 1.0f;
+    }
+    [[deprecated("Use getScale() instead. Will be removed in v1.0.0")]]
+    float getCurrentScale() const { return getScale(); }
+
+    // Segment-count helpers. Used by drawCircle / drawEllipse / Path::arc /
+    // drawRectRounded / drawArc — single source of truth so a future
+    // tweak to the math (e.g. caching, or a different sagitta formula)
+    // propagates everywhere automatically.
+    int decideCircleSegments(float radius) const {
+        if (style_.curve.mode == CurveStyle::Mode::Resolution) {
+            return std::max(3, style_.curve.resolution);
+        }
+        float effTol = style_.curve.tolerance / getScale();
+        return internal::segmentsForCircle(radius, effTol);
+    }
+    int decideArcSegments(float radius, float angleSpan) const {
+        if (style_.curve.mode == CurveStyle::Mode::Resolution) {
+            int full = std::max(3, style_.curve.resolution);
+            int n = (int)std::ceil(full * std::abs(angleSpan) / TAU);
+            return std::max(2, n);
+        }
+        float effTol = style_.curve.tolerance / getScale();
+        return internal::segmentsForArc(radius, angleSpan, effTol);
+    }
+
+    // -----------------------------------------------------------------------
+    // Circle resolution (legacy — kept undeprecated on the context so the
+    // global wrapper in TrussC.h can forward without triggering its own
+    // deprecation warning. The user-facing TrussC.h wrapper IS deprecated.)
+    // -----------------------------------------------------------------------
+    void setCircleResolution(int res) {
+        circleResolution_ = res;          // legacy field, still read by
+                                          // some drawers until C2 migrates them
+        setCurveResolution(res);
+    }
     int getCircleResolution() const { return circleResolution_; }
 
     // -----------------------------------------------------------------------
@@ -168,33 +281,164 @@ public:
         sgl_push_matrix();
     }
 
+    // A pop with nothing pushed is a bug in the caller: warn (rate-limited)
+    // and leave both stacks alone, so TrussC's and sokol_gl's stay in step.
+    // Inside a Node's draw() the stack floor (#348) is that node's depth, so a
+    // pop that would reach its parent's entries is refused the same way.
     void popMatrix() {
-        if (!matrixStack_.empty()) {
-            currentMatrix_ = matrixStack_.back();
-            matrixStack_.pop_back();
+        if (matrixStack_.size() <= stackFloor_.matrix) {
+            warnPopAtFloor(popMatrixWarning_, "popMatrix()", "pushMatrix()");
+            return;
         }
+        currentMatrix_ = matrixStack_.back();
+        matrixStack_.pop_back();
         sgl_pop_matrix();
     }
+
+    size_t getMatrixStackDepth() const { return matrixStack_.size(); }
+    size_t getStyleStackDepth() const { return styleStack_.size(); }
 
     // -----------------------------------------------------------------------
     // Style stack
     // -----------------------------------------------------------------------
 
     void pushStyle() {
+        // Capture the live blend mode (it lives in internal::currentWindowContext().currentBlendMode, not in
+        // style_) so it is saved/restored alongside color/fill/stroke.
+        style_.blend = internal::currentWindowContext().currentBlendMode;
         styleStack_.push_back(style_);
     }
 
     void popStyle() {
-        if (!styleStack_.empty()) {
-            style_ = styleStack_.back();
-            styleStack_.pop_back();
+        if (styleStack_.size() <= stackFloor_.style) {
+            warnPopAtFloor(popStyleWarning_, "popStyle()", "pushStyle()");
+            return;
         }
+        style_ = styleStack_.back();
+        styleStack_.pop_back();
+        applyBlend(style_.blend);
+    }
+
+    // Frame end (#232): whatever a frame left pushed is dropped, so a missing
+    // pop stays contained in the frame where it happened instead of drifting
+    // getMatrix() (billboards, screen-fixed text, shader / PBR draws) and
+    // growing the stacks forever. Warns (rate-limited, as AppEntry::Draw:
+    // "draw() ended with ...") when anything was left. Called at the end of
+    // present(), the draw entry point's end (#349); the sokol_gl side is
+    // reset there too.
+    void resetStacksAtFrameEnd() {
+        warnLeftOpen(AppEntry::Draw, matrixStack_.size(), styleStack_.size());
+        matrixStack_.clear();
+        styleStack_.clear();
+        currentMatrix_ = Mat4::identity();
+        stackFloor_ = StackFloor{};
+    }
+
+    // Stack floor (#348): popMatrix() / popStyle() never pop below these
+    // depths. Node::drawTree() sets it to the depths it sees before draw(),
+    // with the node's type, so a stray pop in draw() is refused (and names the
+    // node) instead of popping the node's own entry and drawing its children
+    // in the parent's space. A 0 floor with no owner is the plain empty-stack
+    // guard.
+    struct StackFloor {
+        size_t matrix = 0;
+        size_t style = 0;
+        const std::type_info* owner = nullptr;  // node type that set it, or null
+    };
+
+    // Set the floor and return the previous one; the caller puts that back
+    // with setStackFloor(prev), since a draw() can run another node's drawTree().
+    StackFloor setStackFloor(size_t matrixDepth, size_t styleDepth, const std::type_info* owner) {
+        StackFloor prev = stackFloor_;
+        stackFloor_ = StackFloor{matrixDepth, styleDepth, owner};
+        return prev;
+    }
+    void setStackFloor(const StackFloor& floor) { stackFloor_ = floor; }
+
+    // When an entry point where TrussC calls app code returns (#349): put the
+    // stacks back to the depths they had when it was entered (EntryStackGuard
+    // records them), naming the entry point in the warning (for an event, the
+    // event's name when given: text only, the rate limit is Event's). Pops go
+    // through popMatrix() / popStyle(), as restoreStackDepth() does, so sokol_gl's
+    // matrix stack returns with TrussC's and the two stay in step, also
+    // mid-frame (the synced update). Only the pushes are undone: a style value
+    // or transform set outside a push carries on.
+    void restoreStacksAtEntryEnd(AppEntry entry, size_t matrixDepth, size_t styleDepth,
+                                 const char* eventName = nullptr) {
+        const size_t md = matrixStack_.size(), sd = styleStack_.size();
+        if (md == matrixDepth && sd == styleDepth) return;
+        if (md >= matrixDepth && sd >= styleDepth) {
+            warnLeftOpen(entry, md - matrixDepth, sd - styleDepth, eventName);
+        } else {
+            // Popped below the depth it was entered at (possible only when
+            // entered with something pushed, e.g. an event during a frame).
+            warnUnbalanced(entryWarning(entry),
+                entrySubject(entry, eventName) + " ended with the stacks off their depth at entry (pushMatrix " +
+                std::to_string((long long)md - (long long)matrixDepth) + ", pushStyle " +
+                std::to_string((long long)sd - (long long)styleDepth) + "); restored");
+        }
+        while (matrixStack_.size() > matrixDepth) popMatrix();
+        while (styleStack_.size() > styleDepth) popStyle();
+        // The lost entries can't be recovered, but refilling the depth keeps
+        // the caller's pops matched to its pushes.
+        while (matrixStack_.size() < matrixDepth) pushMatrix();
+        while (styleStack_.size() < styleDepth) pushStyle();
+    }
+
+    // After a Node's draw() (and its mods) run: if it left the stacks deeper
+    // than it found them (a missing pop), name the node and pop back to that
+    // depth, so its parent's own pop, its children and every later sibling
+    // see the matrix and style they expect. A stray pop is refused at the
+    // floor above; the shallower branch below is a safety net only.
+    void restoreStackDepth(size_t matrixDepth, size_t styleDepth, const char* who) {
+        const size_t md = matrixStack_.size(), sd = styleStack_.size();
+        if (md == matrixDepth && sd == styleDepth) return;
+        if (md >= matrixDepth && sd >= styleDepth) {
+            // Extra pushes: reported like a stray pop, naming the node (#348).
+            std::string what = std::string(who) + "::draw() called ";
+            if (md > matrixDepth) {
+                what += "pushMatrix() without a matching popMatrix()";
+                if (md - matrixDepth > 1) what += " x" + std::to_string(md - matrixDepth);
+            }
+            if (sd > styleDepth) {
+                if (md > matrixDepth) what += " and ";
+                what += "pushStyle() without a matching popStyle()";
+                if (sd - styleDepth > 1) what += " x" + std::to_string(sd - styleDepth);
+            }
+            warnUnbalanced(nodeDrawWarning_, what + " (dropped)");
+        } else {
+            warnUnbalanced(nodeDrawWarning_,
+                std::string(who) + "::draw() left the stacks unbalanced (pushMatrix " +
+                std::to_string((long long)md - (long long)matrixDepth) + ", pushStyle " +
+                std::to_string((long long)sd - (long long)styleDepth) + ")");
+        }
+        while (matrixStack_.size() > matrixDepth) popMatrix();
+        while (styleStack_.size() > styleDepth) popStyle();
+        // Shallower than expected (only if something got past the floor): the
+        // lost entries can't be recovered, but refilling the depth keeps the
+        // parent's pops matched to its pushes.
+        while (matrixStack_.size() < matrixDepth) pushMatrix();
+        while (styleStack_.size() < styleDepth) pushStyle();
     }
 
     // Reset style to default values (white color, fill enabled, etc.)
     void resetStyle() {
         style_ = Style();
+        applyBlend(style_.blend);
     }
+
+private:
+    // Restore the 2D blend pipeline only when the mode actually changed (a redundant
+    // load is otherwise a no-op that sokol_gl batches away, but we skip it anyway).
+    // No-op inside an FBO pass, which uses its own accumulating pipeline.
+    void applyBlend(BlendMode mode) {
+        if (mode == internal::currentWindowContext().currentBlendMode) return;
+        internal::currentWindowContext().currentBlendMode = mode;
+        if (!internal::currentWindowContext().inFboPass) {
+            internal::loadPipeline(internal::active2D(mode));
+        }
+    }
+public:
 
     // Main implementation (Vec3)
     void translate(Vec3 pos) {
@@ -258,31 +502,37 @@ public:
         sgl_scale(sx, sy, sz);
     }
 
-    Mat4 getCurrentMatrix() const { return currentMatrix_; }
+    // Current accumulated model matrix.
+    Mat4 getMatrix() const { return currentMatrix_; }
+    [[deprecated("Use getMatrix() instead. Will be removed in v1.0.0")]]
+    Mat4 getCurrentMatrix() const { return getMatrix(); }
 
     void resetMatrix() {
         currentMatrix_ = Mat4::identity();
         // Restore default view matrix (camera lookat) set by setupScreenFovWithSize
         // This works correctly both in main screen and FBO contexts
         // Note: Mat4 is row-major, sokol_gl expects column-major, so transpose
-        Mat4 t = internal::currentViewMatrix.transposed();
+        Mat4 t = internal::currentWindowContext().currentViewMatrix.transposed();
         sgl_load_matrix(t.m);
     }
 
-    // Apply transformation matrix (multiplies with current matrix, like translate/rotate)
-    void setMatrix(const Mat4& mat) {
+    // Multiply the current matrix by `mat` (relative transform, like translate/rotate).
+    // NOTE: this was previously misnamed setMatrix(); that name now REPLACES.
+    void multMatrix(const Mat4& mat) {
         currentMatrix_ = currentMatrix_ * mat;
         // sokol_gl expects column-major, but Mat4 is row-major
         Mat4 t = mat.transposed();
         sgl_mult_matrix(t.m);
     }
 
-    // Load matrix directly (replaces current matrix - use with caution, may break camera setup)
-    void loadMatrix(const Mat4& mat) {
+    // Replace the current matrix with `mat` (absolute - use with caution, may break camera setup).
+    void setMatrix(const Mat4& mat) {
         currentMatrix_ = mat;
         Mat4 t = mat.transposed();
         sgl_load_matrix(t.m);
     }
+    [[deprecated("Use setMatrix() instead. Will be removed in v1.0.0")]]
+    void loadMatrix(const Mat4& mat) { setMatrix(mat); }
 
     // -----------------------------------------------------------------------
     // Basic shape drawing (uses VertexWriter for shader support)
@@ -343,9 +593,24 @@ public:
         drawRectSquircle(Vec3(x, y, 0), Vec2(w, h), radius);
     }
 
+    // -------------------------------------------------------------------------
+    // Superellipse (Lamé curve): |x/rx|^n + |y/ry|^n = 1, inscribed in the
+    // rect (pos, size) — drop-in alternative to drawRectRounded. The exponent
+    // n morphs the shape: 2 = ellipse, 4 = squircle, higher -> closer to the
+    // rect, 1 = diamond, <1 = concave (star-like). Default n=5 approximates
+    // the Apple app-icon silhouette. Aspect ratio comes from size.
+    // (Implementation in tcRenderContext.cpp)
+    // -------------------------------------------------------------------------
+    void drawSuperellipse(Vec3 pos, Vec2 size, float n = 5.0f);
+
+    void drawSuperellipse(float x, float y, float w, float h, float n = 5.0f) {
+        drawSuperellipse(Vec3(x, y, 0), Vec2(w, h), n);
+    }
+
     // Main implementation (Vec3)
     void drawCircle(Vec3 center, float radius) {
-        int segments = circleResolution_;
+        int segments = decideCircleSegments(radius);
+        if (segments == 0) return;
         float cx = center.x, cy = center.y, cz = center.z;
         auto& writer = internal::getActiveWriter();
 
@@ -380,7 +645,10 @@ public:
 
     // Main implementation (Vec3)
     void drawEllipse(Vec3 center, Vec2 radii) {
-        int segments = circleResolution_;
+        // Use the larger radius for the segment count — conservative
+        // approximation; matches what oF and most engines do for ellipses.
+        int segments = decideCircleSegments(std::max(radii.x, radii.y));
+        if (segments == 0) return;
         float cx = center.x, cy = center.y, cz = center.z;
         float rx = radii.x, ry = radii.y;
         auto& writer = internal::getActiveWriter();
@@ -416,6 +684,231 @@ public:
 
     void drawEllipse(float cx, float cy, float rx, float ry) {
         drawEllipse(Vec3(cx, cy, 0), Vec2(rx, ry));
+    }
+
+    // -----------------------------------------------------------------------
+    // Arc — circular arc spanning [angleBegin, angleEnd] radians.
+    //
+    // Stroke: just the arc curve (open).
+    // Fill:   pie sector — closes to the center as a fan, like p5.js /
+    //         Processing. This is the one place where fill and stroke do
+    //         not share the same boundary (other primitives do). It's a
+    //         deliberate convenience: filling a partial arc almost always
+    //         means "I want a pie slice."
+    //
+    // If you need a different closure (chord / open fill / custom shape),
+    // build it from the low-level primitive `appendArc()` inside
+    // beginShape()/endShape(), which emits rim points only and never
+    // injects a center vertex.
+    //
+    // Angles in **radians**, going counter-clockwise (mathematical
+    // convention). For a quick semicircle: drawArc(x, y, r, 0, HALF_TAU).
+    // -----------------------------------------------------------------------
+    void drawArc(Vec3 center, float radius, float angleBegin, float angleEnd) {
+        if (radius <= 0.0f) return;
+        float span = angleEnd - angleBegin;
+        if (span == 0.0f) return;
+        int segments = decideArcSegments(radius, std::abs(span));
+        if (segments < 2) segments = 2;
+        float cx = center.x, cy = center.y, cz = center.z;
+        auto& writer = internal::getActiveWriter();
+
+        if (fillEnabled_) {
+            // TriangleStrip alternating center / rim — same fan pattern
+            // drawCircle uses, just over a partial angular range.
+            writer.begin(PrimitiveType::TriangleStrip);
+            writer.color(currentR_, currentG_, currentB_, currentA_);
+            for (int i = 0; i <= segments; i++) {
+                float a = angleBegin + span * ((float)i / (float)segments);
+                float px = cx + std::cos(a) * radius;
+                float py = cy + std::sin(a) * radius;
+                writer.vertex(cx, cy, cz);
+                writer.vertex(px, py, cz);
+            }
+            writer.end();
+        }
+        if (strokeEnabled_) {
+            writer.begin(PrimitiveType::LineStrip);
+            writer.color(currentR_, currentG_, currentB_, currentA_);
+            for (int i = 0; i <= segments; i++) {
+                float a = angleBegin + span * ((float)i / (float)segments);
+                writer.vertex(cx + std::cos(a) * radius,
+                              cy + std::sin(a) * radius, cz);
+            }
+            writer.end();
+        }
+    }
+
+    void drawArc(float x, float y, float radius, float angleBegin, float angleEnd) {
+        drawArc(Vec3(x, y, 0), radius, angleBegin, angleEnd);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bezier and curve primitives — stroke only (open curves have no
+    // natural enclosed region; build a Path if you want a filled shape
+    // that includes a Bezier piece).
+    //
+    //   drawBezier(p0, p1, p2, p3)        — cubic
+    //   drawBezier(p0, p1, p2)            — quadratic
+    //   drawBezier(std::vector<Vec3>)     — n-th order (control polygon)
+    //   drawCurve (p0, p1, p2, p3)        — Catmull-Rom interpolating p1->p2,
+    //                                       using p0/p3 as tangent influences
+    //                                       (same semantics as oF's drawCurve)
+    //
+    // In Tolerance mode each curve is adaptively subdivided so the polyline
+    // stays within `tolerance` (in screen pixels) of the true curve. In
+    // Resolution mode the curve is sampled at N+1 uniform t-values.
+    // -----------------------------------------------------------------------
+private:
+    void emitPolylineStroke_(const std::vector<Vec3>& pts) {
+        if (pts.size() < 2) return;
+        auto& writer = internal::getActiveWriter();
+        writer.begin(PrimitiveType::LineStrip);
+        writer.color(currentR_, currentG_, currentB_, currentA_);
+        for (auto& p : pts) writer.vertex(p.x, p.y, p.z);
+        writer.end();
+    }
+
+    // Uniform-t cubic sampling for resolution mode.
+    static void sampleCubicUniform_(const Vec3& p0, const Vec3& p1,
+                                    const Vec3& p2, const Vec3& p3,
+                                    int n, std::vector<Vec3>& out) {
+        out.reserve(out.size() + n + 1);
+        for (int i = 0; i <= n; i++) {
+            float t = (float)i / (float)n;
+            float u = 1 - t;
+            float b0 = u*u*u, b1 = 3*u*u*t, b2 = 3*u*t*t, b3 = t*t*t;
+            out.push_back(Vec3{
+                b0*p0.x + b1*p1.x + b2*p2.x + b3*p3.x,
+                b0*p0.y + b1*p1.y + b2*p2.y + b3*p3.y,
+                b0*p0.z + b1*p1.z + b2*p2.z + b3*p3.z});
+        }
+    }
+    static void sampleQuadUniform_(const Vec3& p0, const Vec3& p1, const Vec3& p2,
+                                   int n, std::vector<Vec3>& out) {
+        out.reserve(out.size() + n + 1);
+        for (int i = 0; i <= n; i++) {
+            float t = (float)i / (float)n;
+            float u = 1 - t;
+            float b0 = u*u, b1 = 2*u*t, b2 = t*t;
+            out.push_back(Vec3{
+                b0*p0.x + b1*p1.x + b2*p2.x,
+                b0*p0.y + b1*p1.y + b2*p2.y,
+                b0*p0.z + b1*p1.z + b2*p2.z});
+        }
+    }
+public:
+
+    // drawBezier / drawCurve are inherently strokes (open curves cannot be
+    // filled unambiguously). Like drawLine, they ignore the fill/stroke mode
+    // and always emit a polyline. Use Path for filled curve shapes.
+    void drawBezier(Vec3 p0, Vec3 p1, Vec3 p2, Vec3 p3) {
+        std::vector<Vec3> pts;
+        if (style_.curve.mode == CurveStyle::Mode::Tolerance) {
+            tessellateCubicBezier(p0, p1, p2, p3,
+                                  style_.curve.tolerance / getScale(), pts);
+        } else {
+            sampleCubicUniform_(p0, p1, p2, p3,
+                                std::max(2, style_.curve.resolution), pts);
+        }
+        emitPolylineStroke_(pts);
+    }
+
+    void drawBezier(Vec3 p0, Vec3 p1, Vec3 p2) {
+        std::vector<Vec3> pts;
+        if (style_.curve.mode == CurveStyle::Mode::Tolerance) {
+            tessellateQuadBezier(p0, p1, p2,
+                                 style_.curve.tolerance / getScale(), pts);
+        } else {
+            sampleQuadUniform_(p0, p1, p2,
+                               std::max(2, style_.curve.resolution), pts);
+        }
+        emitPolylineStroke_(pts);
+    }
+
+    void drawBezier(const std::vector<Vec3>& controlPoints) {
+        if (controlPoints.size() < 2) return;
+        if (controlPoints.size() == 2) {
+            drawLine(controlPoints[0], controlPoints[1]);
+            return;
+        }
+        // Fast paths for the two common orders. Same numerical result as
+        // tessellateBezierN — just avoids the extra std::vector copy that
+        // path takes for its in-place de Casteljau scratch buffer.
+        if (controlPoints.size() == 3) {
+            drawBezier(controlPoints[0], controlPoints[1], controlPoints[2]);
+            return;
+        }
+        if (controlPoints.size() == 4) {
+            drawBezier(controlPoints[0], controlPoints[1],
+                       controlPoints[2], controlPoints[3]);
+            return;
+        }
+        std::vector<Vec3> pts;
+        if (style_.curve.mode == CurveStyle::Mode::Tolerance) {
+            tessellateBezierN(controlPoints,
+                              style_.curve.tolerance / getScale(), pts);
+        } else {
+            // Uniform t via repeated de Casteljau evaluation.
+            int n = std::max(2, style_.curve.resolution);
+            pts.reserve(n + 1);
+            for (int i = 0; i <= n; i++) {
+                float t = (float)i / (float)n;
+                std::vector<Vec3> work = controlPoints;
+                int sz = (int)work.size();
+                for (int level = 1; level < sz; level++) {
+                    for (int j = 0; j < sz - level; j++) {
+                        work[j] = Vec3{
+                            work[j].x + (work[j+1].x - work[j].x) * t,
+                            work[j].y + (work[j+1].y - work[j].y) * t,
+                            work[j].z + (work[j+1].z - work[j].z) * t};
+                    }
+                }
+                pts.push_back(work[0]);
+            }
+        }
+        emitPolylineStroke_(pts);
+    }
+
+    // Catmull-Rom interpolating p1 -> p2, using p0 and p3 as tangent
+    // influences. Matches openFrameworks' ofDrawCurve / curveVertex
+    // semantics. Internally converted to the equivalent cubic Bezier
+    // (B1 = p1 + (p2-p0)/6, B2 = p2 - (p3-p1)/6) so it inherits the
+    // same adaptive subdivision and mode handling as drawBezier.
+    void drawCurve(Vec3 p0, Vec3 p1, Vec3 p2, Vec3 p3) {
+        Vec3 b1{p1.x + (p2.x - p0.x) / 6.0f,
+                p1.y + (p2.y - p0.y) / 6.0f,
+                p1.z + (p2.z - p0.z) / 6.0f};
+        Vec3 b2{p2.x - (p3.x - p1.x) / 6.0f,
+                p2.y - (p3.y - p1.y) / 6.0f,
+                p2.z - (p3.z - p1.z) / 6.0f};
+        drawBezier(p1, b1, b2, p2);
+    }
+
+    // Catmull-Rom chained through every point. Needs at least 4 points;
+    // emits (N-3) segments, each interpolating points[i+1] -> points[i+2]
+    // with points[i] / points[i+3] as tangent influences.
+    void drawCurve(const std::vector<Vec3>& points) {
+        if (points.size() < 4) return;
+        for (size_t i = 0; i + 3 < points.size(); i++) {
+            drawCurve(points[i], points[i+1], points[i+2], points[i+3]);
+        }
+    }
+
+    // Closed (looped) Catmull-Rom — the curve passes through ALL points
+    // and joins last->first smoothly. Tangents wrap around, so a minimum
+    // of 3 points is enough.
+    void drawCurve(const std::vector<Vec3>& points, bool closed) {
+        if (!closed) { drawCurve(points); return; }
+        const int n = (int)points.size();
+        if (n < 3) return;
+        for (int i = 0; i < n; i++) {
+            const Vec3& p0 = points[(i - 1 + n) % n];
+            const Vec3& p1 = points[i];
+            const Vec3& p2 = points[(i + 1) % n];
+            const Vec3& p3 = points[(i + 2) % n];
+            drawCurve(p0, p1, p2, p3);
+        }
     }
 
     // Main implementation (Vec3)
@@ -485,13 +978,30 @@ public:
 
     void drawBitmapString(const std::string& text, float x, float y, bool screenFixed = true);
 
+    // Vec3 overload. The position is transformed by the current model matrix to
+    // world space and projected through the current camera context — an EasyCam
+    // scope or the ambient default screen alike; the glyphs are then drawn as a
+    // screen-aligned BILLBOARD on top of the scene (no depth test). On the
+    // default screen the z=0 plane maps pixel-identically to 2D coordinates, so
+    // Vec3(x, y, 0) draws exactly where (x, y) does, while z != 0 projects to
+    // the true 3D point. A point behind the camera draws nothing.
+    //   screenFixed=true  (default): constant pixel size regardless of distance.
+    //   screenFixed=false: the glyph cell is measured in world units at the
+    //                      label's depth, so it foreshortens with perspective
+    //                      (shrinks with distance).
     void drawBitmapString(const std::string& text, Vec3 pos, bool screenFixed = true) {
+        if (drawBitmapStringBillboard(text, pos, textAlignH_, textAlignV_, screenFixed, 1.0f)) return;
         drawBitmapString(text, pos.x, pos.y, screenFixed);
     }
 
     void drawBitmapString(const std::string& text, float x, float y, float scale);
 
+    // Vec3 + scale overload. Billboards through the current camera context with
+    // a perspective-scaled glyph cell (like screenFixed=false) multiplied by
+    // `scale`, so the label shrinks with distance. At z=0 on the default screen
+    // the perspective factor is 1, matching the 2D (x, y, scale) overload's size.
     void drawBitmapString(const std::string& text, Vec3 pos, float scale) {
+        if (drawBitmapStringBillboard(text, pos, textAlignH_, textAlignV_, /*screenFixed=*/false, scale)) return;
         drawBitmapString(text, pos.x, pos.y, scale);
     }
 
@@ -515,10 +1025,28 @@ public:
     void drawBitmapString(const std::string& text, float x, float y,
                           Direction h, Direction v, bool screenFixed = true);
 
+    // Vec3 + alignment overload. Same billboard rule as the Vec3 overloads
+    // above (see their docs), but with explicit horizontal/vertical alignment
+    // of the label around the projected point.
     void drawBitmapString(const std::string& text, Vec3 pos,
                           Direction h, Direction v, bool screenFixed = true) {
+        if (drawBitmapStringBillboard(text, pos, h, v, screenFixed, 1.0f)) return;
         drawBitmapString(text, pos.x, pos.y, h, v, screenFixed);
     }
+
+    // Billboard a WORLD position through the current camera context (EasyCam
+    // scope or the ambient default screen). Returns true when it handled the
+    // draw — including the behind-camera case where it correctly draws nothing
+    // — and false only when no camera context exists (headless / before any
+    // camera setup) so the Vec3 overloads fall back to plain 2D.
+    // `pos` is transformed by the current model matrix (pushMatrix/translate
+    // apply) then projected. screenFixed=true keeps a constant pixel size;
+    // screenFixed=false measures the glyph cell in world units at the label's
+    // depth so it foreshortens with distance. `extraScale` multiplies the final
+    // glyph size in both modes. Implementation in tcRenderContext.cpp.
+    bool drawBitmapStringBillboard(const std::string& text, Vec3 pos,
+                                   Direction h, Direction v,
+                                   bool screenFixed, float extraScale);
 
     // -----------------------------------------------------------------------
     // Bitmap string metrics
@@ -532,21 +1060,19 @@ public:
     float getBitmapStringWidth(const std::string& text) const {
         float width = 0;
         float maxWidth = 0;
-        const float charW = bitmapfont::CHAR_TEX_WIDTH;
+        const float charW = bitmapfont::CHAR_TEX_WIDTH;  // halfwidth advance
 
-        for (char c : text) {
-            if (c == '\n') {
-                if (width > maxWidth) maxWidth = width;
-                width = 0;
-                continue;
-            }
-            if (c == '\t') {
-                width += charW * 8;
-                continue;
-            }
-            if (c >= 32) {
-                width += charW;
-            }
+        const char* p   = text.data();
+        const char* end = p + text.size();
+        while (p < end) {
+            // Peek raw byte first for newline / tab fast-path
+            unsigned char b0 = (unsigned char)*p;
+            if (b0 == '\n') { ++p; if (width > maxWidth) maxWidth = width; width = 0; continue; }
+            if (b0 == '\t') { ++p; width += charW * 8; continue; }
+            if (b0 < 32)    { ++p; continue; }
+            uint32_t cp = bitmapfont::utf8Decode(p, end);
+            if (cp == 0) break;
+            width += (float)bitmapfont::codepointPixelWidth(cp);
         }
 
         return (width > maxWidth) ? width : maxWidth;
@@ -557,7 +1083,8 @@ public:
         for (char c : text) {
             if (c == '\n') lines++;
         }
-        // First line uses CHAR_TEX_HEIGHT, subsequent lines use bitmapLineHeight
+        // Newline byte isn't a UTF-8 continuation byte (always 0x0A),
+        // so a raw byte scan is safe.
         return bitmapfont::CHAR_TEX_HEIGHT + (lines - 1) * style_.bitmapLineHeight;
     }
 
@@ -574,10 +1101,19 @@ private:
         float strokeWeight = 1.0f;
         StrokeCap strokeCap = StrokeCap::Butt;
         StrokeJoin strokeJoin = StrokeJoin::Miter;
-        int circleResolution = 20;
+        float pointSize = 1.0f;                    // logical px, like strokeWeight
+        PointStyle pointStyle = PointStyle::Square;
+        int circleResolution = 20;     // legacy, will be removed once all
+                                       // draw* migrate to curve.resolution
+        CurveStyle curve;              // shared by all curved primitives
+                                       // (circle, ellipse, arc, bezier, ...)
         Direction textAlignH = Direction::Left;
         Direction textAlignV = Direction::Top;
         float bitmapLineHeight = bitmapfont::CHAR_TEX_HEIGHT;
+        // Mirror of internal::currentWindowContext().currentBlendMode. blend state itself lives outside the
+        // RenderContext (it maps to an sgl pipeline), so push/popStyle capture and
+        // restore it explicitly rather than via this field's value alone.
+        BlendMode blend = BlendMode::Alpha;
     };
 
     // Current style
@@ -603,6 +1139,64 @@ private:
     // Matrix stack
     Mat4 currentMatrix_ = Mat4::identity();
     std::vector<Mat4> matrixStack_;
+
+    // Unbalanced push/pop warnings (#232). A missing pop repeats every frame,
+    // so each kind logs its first occurrence, then at most once per 5 s with
+    // the count since the last line.
+    struct RateLimitedWarning {
+        std::chrono::steady_clock::time_point last{};
+        bool logged = false;
+        int suppressed = 0;
+    };
+    RateLimitedWarning popMatrixWarning_, popStyleWarning_, nodeDrawWarning_;
+    // One per entry point (#349), so a leak in one doesn't hide another's.
+    RateLimitedWarning entryWarnings_[static_cast<size_t>(AppEntry::Count)];
+
+    RateLimitedWarning& entryWarning(AppEntry e) { return entryWarnings_[static_cast<size_t>(e)]; }
+
+    // An event names itself ("keyPressed()") when the caller knows which.
+    static std::string entrySubject(AppEntry e, const char* eventName) {
+        return (e == AppEntry::Event && eventName) ? std::string(eventName) : std::string(appEntryLabel(e));
+    }
+
+    // "<entry> ended with N pushMatrix() and M pushStyle() still open (missing
+    // pop); dropped", under the entry point's own rate limit.
+    void warnLeftOpen(AppEntry e, size_t matrixLeft, size_t styleLeft, const char* eventName = nullptr) {
+        if (matrixLeft == 0 && styleLeft == 0) return;
+        warnUnbalanced(entryWarning(e),
+            entrySubject(e, eventName) + " ended with " + std::to_string(matrixLeft) +
+            " pushMatrix() and " + std::to_string(styleLeft) +
+            " pushStyle() still open (missing pop); dropped");
+    }
+
+    StackFloor stackFloor_;
+
+    // A pop refused at the floor (#348): name the node that set it, or use the
+    // generic message outside any node's draw(). The name is resolved only
+    // here, never per node per frame.
+    void warnPopAtFloor(RateLimitedWarning& generic, const char* pop, const char* push) {
+        if (stackFloor_.owner) {
+            warnUnbalanced(nodeDrawWarning_,
+                typeName(*stackFloor_.owner) + "::draw() called " + pop +
+                " without a matching " + push + " (ignored)");
+        } else {
+            warnUnbalanced(generic, std::string(pop) + " without a matching " + push);
+        }
+    }
+
+    void warnUnbalanced(RateLimitedWarning& w, const std::string& what) {
+        const auto now = std::chrono::steady_clock::now();
+        if (w.logged && now - w.last < std::chrono::seconds(5)) {
+            w.suppressed++;
+            return;
+        }
+        auto line = logWarning("RenderContext");
+        line << what;
+        if (w.suppressed > 0) line << " (+" << w.suppressed << " more since the last report)";
+        w.logged = true;
+        w.last = now;
+        w.suppressed = 0;
+    }
 
     // Text alignment (shortcut to style_)
     Direction& textAlignH_ = style_.textAlignH;
@@ -640,10 +1234,41 @@ private:
 
 // ---------------------------------------------------------------------------
 // Default context (singleton)
+// Non-inline so that Host and Guest (hot-reload DLL) share the same
+// static instance — inline would give each module its own copy on Windows.
 // ---------------------------------------------------------------------------
-inline RenderContext& getDefaultContext() {
-    static RenderContext instance;
-    return instance;
-}
+RenderContext& getDefaultContext();
+
+// Wraps one entry point where TrussC calls app code (#349), as one line at
+// the top of its scope: `EntryStackGuard guard(AppEntry::Update);`. The
+// constructor records the matrix and style stack depths; the destructor puts
+// them back (restoreStacksAtEntryEnd) and warns under the entry point's label
+// and rate limit, so an early return can't skip it. For an event, eventName
+// (a string literal, e.g. "keyPressed()") only names it in the warning.
+class EntryStackGuard {
+public:
+    explicit EntryStackGuard(AppEntry entry, const char* eventName = nullptr)
+        : entry_(entry), eventName_(eventName), rc_(getDefaultContext()),
+          matrixDepth_(rc_.getMatrixStackDepth()), styleDepth_(rc_.getStyleStackDepth()) {}
+    ~EntryStackGuard() { rc_.restoreStacksAtEntryEnd(entry_, matrixDepth_, styleDepth_, eventName_); }
+    EntryStackGuard(const EntryStackGuard&) = delete;
+    EntryStackGuard& operator=(const EntryStackGuard&) = delete;
+
+private:
+    AppEntry entry_;
+    const char* eventName_;
+    RenderContext& rc_;
+    size_t matrixDepth_, styleDepth_;
+};
+
+} // namespace internal
+
+// Compat: keep RenderContext / getDefaultContext reachable from trussc:: so the
+// free drawing wrappers (and any advanced user reaching for the context) keep
+// working; the canonical home is internal::. The RenderContext alias is
+// [[deprecated]] — the public drawing API is the free functions; reach the
+// context via internal::getDefaultContext() only if you truly need it.
+using RenderContext [[deprecated("RenderContext is internal; use the free drawing functions (setColor/drawRect/...). Reach the context via internal::getDefaultContext() if you really need it. Will be removed in v1.0.0")]] = internal::RenderContext;
+using internal::getDefaultContext;
 
 } // namespace trussc

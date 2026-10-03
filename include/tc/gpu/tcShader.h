@@ -28,6 +28,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cstring>
+#include "../utils/tcAnnotations.h"
 
 namespace trussc {
 
@@ -94,16 +95,29 @@ public:
     }
 
     void clear() {
+        // Defer all destroys to end-of-frame (tcGpuDestroyQueue.h): a deferred
+        // shader draw recorded this frame may still reference these handles.
+        // This is what makes scope-local Shaders safe — the captured pipeline
+        // and buffers outlive the object until the flush.
         if (loaded) {
-            if (indexBuffer.id) sg_destroy_buffer(indexBuffer);
-            if (vertexBuffer.id) sg_destroy_buffer(vertexBuffer);
-            if (pipeline.id) sg_destroy_pipeline(pipeline);
-            if (shader.id) sg_destroy_shader(shader);
+            internal::deferGpuDestroy(indexBuffer);
+            internal::deferGpuDestroy(vertexBuffer);
+            internal::deferGpuDestroy(pipeline);
+            internal::deferGpuDestroy(shader);
         }
+        for (auto& [key, pip] : targetPipelines_) {
+            internal::deferGpuDestroy(pip);
+        }
+        targetPipelines_.clear();
+        for (auto& [slot, cached] : imageViews_) {
+            internal::deferGpuDestroy(cached.view);
+        }
+        imageViews_.clear();
         shader = {};
         pipeline = {};
         vertexBuffer = {};
         indexBuffer = {};
+        stream_.reset();
         loaded = false;
     }
 
@@ -116,13 +130,19 @@ public:
     void begin() {
         if (!loaded) return;
 
-        // Push to stack
-        internal::shaderStack.push_back(this);
+        // Push to stack (per-window)
+        auto& wctx = internal::currentWindowContext();
+        wctx.shaderStack.push_back(this);
 
         // Increment layer for post-shader sokol_gl draws
-        // (shader draws will be deferred and executed between layers)
-        internal::sglLayerNext++;
-        sgl_layer(internal::sglLayerNext);
+        // (shader draws will be deferred and executed between layers).
+        // Inside an FBO pass the layering is handled per-submission instead
+        // (fboLayerNext bump in submitVertices, like the deferred PBR path),
+        // so only the swapchain layer counter is advanced here.
+        if (!wctx.inFboPass) {
+            wctx.sglLayerNext++;
+            sgl_layer(wctx.sglLayerNext);
+        }
 
         // Call virtual hook
         onBegin();
@@ -130,8 +150,9 @@ public:
 
     void end() {
         if (!loaded) return;
-        if (internal::shaderStack.empty()) return;
-        if (internal::shaderStack.back() != this) {
+        auto& stack = internal::currentWindowContext().shaderStack;
+        if (stack.empty()) return;
+        if (stack.back() != this) {
             logWarning("Shader") << "end() called on wrong shader";
             return;
         }
@@ -140,10 +161,10 @@ public:
         onEnd();
 
         // Pop from stack
-        internal::shaderStack.pop_back();
+        stack.pop_back();
 
         // Restore sokol_gl state if no more shaders
-        if (internal::shaderStack.empty()) {
+        if (stack.empty()) {
             // Reset sokol_gfx state cache so sokol_gl can apply its pipeline
             sg_reset_state_cache();
         }
@@ -206,6 +227,8 @@ public:
         storeUniform(slot, data, size);
     }
 
+protected:
+    // Internal uniform plumbing — protected so Shader subclasses can reuse it.
     // Store uniform data for later application
     void storeUniform(int slot, const void* data, size_t size) {
         pendingUniforms[slot].assign((const uint8_t*)data, (const uint8_t*)data + size);
@@ -218,13 +241,27 @@ public:
             sg_apply_uniforms(slot, &range);
         }
     }
+public:
 
     // -------------------------------------------------------------------------
     // Texture binding
     // -------------------------------------------------------------------------
 
+    // Convenience overload taking a raw sg_image. sokol's binding model needs
+    // an sg_view, so one is created here and cached per slot (recreated only
+    // when the image changes; the old view goes through the deferred-destroy
+    // queue since a recorded draw may still reference it). Prefer the sg_view
+    // overload when a view is already available (e.g. Texture::getView()).
     void setTexture(int slot, sg_image image, sg_sampler sampler) {
-        pendingTextures[slot] = { image, sampler };
+        auto& cached = imageViews_[slot];
+        if (cached.image.id != image.id) {
+            internal::deferGpuDestroy(cached.view);
+            sg_view_desc vd = {};
+            vd.texture.image = image;
+            cached.view = sg_make_view(&vd);
+            cached.image = image;
+        }
+        pendingViews[slot] = { cached.view, sampler };
     }
 
     void setTexture(int slot, sg_view view, sg_sampler sampler) {
@@ -237,131 +274,101 @@ public:
 
     void submitVertices(const ShaderVertex* data, int count, PrimitiveType type) {
         if (count == 0) return;
+        if (!loaded) return;
 
         // Lines/LineStrip are not supported in shader mode (use StrokeMesh instead)
         if (type == PrimitiveType::Lines || type == PrimitiveType::LineStrip) {
             return;
         }
 
-        // Defer this draw - will be executed in present() between sokol_gl layers
-        DeferredShaderDraw draw;
-        draw.layerId = internal::sglLayerNext - 1;  // Layer before this shader
-        draw.shader = this;
+        // Capture contract: snapshot EVERYTHING the replay needs NOW, so the
+        // flush never touches this Shader object (it may be scope-local and
+        // destroyed before present()) and later setUniform()/setTexture()
+        // calls cannot retroactively change this draw. Same pattern as
+        // PbrDrawCommand; executed by internal::executeDeferredShaderDraw().
+        // Grow before capturing any handles in this sokol frame. Later FBO
+        // flushes can request growth, but must not replace this frame's buffers.
+        if (stream_) {
+            const auto growth = stream_->beginFrame(vertexBuffer, indexBuffer);
+            if (growth == internal::ShaderStreamGrowth::Grown) {
+                logWarning("Shader") << "Stream buffers grew to "
+                    << sg_query_buffer_size(vertexBuffer) / sizeof(ShaderVertex)
+                    << " vertices and " << sg_query_buffer_size(indexBuffer) / sizeof(uint32_t)
+                    << " indices";
+            } else if (growth == internal::ShaderStreamGrowth::Failed) {
+                logError("Shader") << "Failed to grow stream buffers";
+            }
+        }
+        internal::DeferredShaderDraw draw;
+        draw.stream = stream_;
+        draw.pipeline = pipelineForCurrentTarget();  // target-resolved (swapchain vs FBO)
         draw.vertices.assign(data, data + count);
         draw.type = type;
-        internal::deferredShaderDraws.push_back(std::move(draw));
-    }
 
-    // Execute a deferred draw (called from present())
-    void executeDeferredDraw(const std::vector<ShaderVertex>& vertices, PrimitiveType type) {
-        if (vertices.empty()) return;
-
-        // Ensure pipeline and uniforms are applied
-        sg_apply_pipeline(pipeline);
-        applyUniforms();
-
-        // Append to vertex buffer
-        sg_range range = { vertices.data(), vertices.size() * sizeof(ShaderVertex) };
-        int vertexOffset = sg_append_buffer(vertexBuffer, &range);
-        if (vertexOffset < 0) {
-            logWarning("Shader") << "Vertex buffer overflow, skipping draw";
-            return;
+        // Snapshot uniform block bytes (the same bytes applyUniforms() would
+        // upload, but frozen per draw instead of last-write-wins).
+        draw.uniforms.reserve(pendingUniforms.size());
+        for (const auto& [slot, bytes] : pendingUniforms) {
+            draw.uniforms.emplace_back(slot, bytes);
         }
 
-        // Setup bindings
+        // Snapshot bindings: stream buffers + texture view/sampler pairs.
         sg_bindings bind = {};
         bind.vertex_buffers[0] = vertexBuffer;
-
-        // Apply pending textures
-        for (auto& [slot, tex] : pendingViews) {
+        for (const auto& [slot, tex] : pendingViews) {
             bind.views[slot] = tex.view;
             bind.samplers[slot] = tex.sampler;
         }
-
-        setupBindings(bind);
-
-        // Generate triangle indices
-        std::vector<uint16_t> indices;
-        int count = (int)vertices.size();
-
-        if (type == PrimitiveType::Quads) {
-            int numQuads = count / 4;
-            indices.reserve(numQuads * 6);
-            for (int i = 0; i < numQuads; i++) {
-                int base = i * 4;
-                indices.push_back(base + 0);
-                indices.push_back(base + 1);
-                indices.push_back(base + 2);
-                indices.push_back(base + 0);
-                indices.push_back(base + 2);
-                indices.push_back(base + 3);
-            }
-        } else if (type == PrimitiveType::TriangleStrip) {
-            if (count >= 3) {
-                indices.reserve((count - 2) * 3);
-                for (int i = 0; i < count - 2; i++) {
-                    if (i % 2 == 0) {
-                        indices.push_back(i);
-                        indices.push_back(i + 1);
-                        indices.push_back(i + 2);
-                    } else {
-                        indices.push_back(i + 1);
-                        indices.push_back(i);
-                        indices.push_back(i + 2);
-                    }
-                }
-            }
-        } else if (type == PrimitiveType::Triangles) {
-            indices.reserve(count);
-            for (int i = 0; i < count; i++) {
-                indices.push_back((uint16_t)i);
-            }
-        } else if (type == PrimitiveType::Points) {
-            return;
-        }
-
-        // Adjust indices for vertex buffer offset
-        int baseVertex = vertexOffset / sizeof(ShaderVertex);
-        for (auto& idx : indices) {
-            idx += baseVertex;
-        }
-
-        // Append to index buffer
-        sg_range idxRange = { indices.data(), indices.size() * sizeof(uint16_t) };
-        int indexOffset = sg_append_buffer(indexBuffer, &idxRange);
-        if (indexOffset < 0) {
-            logWarning("Shader") << "Index buffer overflow, skipping draw";
-            return;
-        }
-
+        setupBindings(bind);  // subclass hook (runs at submission, object is alive)
         bind.index_buffer = indexBuffer;
-        bind.vertex_buffer_offsets[0] = 0;
-        sg_apply_bindings(&bind);
+        draw.bindings = bind;
 
-        // Draw
-        int baseElement = indexOffset / sizeof(uint16_t);
-        sg_draw(baseElement, (int)indices.size(), 1);
+        auto& wctx = internal::currentWindowContext();
+        if (wctx.inFboPass) {
+            // Defer into the per-FBO list; flushed per-layer by
+            // flushFboDeferredPbr() at Fbo::end()/clearColor(). Bump the FBO
+            // layer so 2D drawn after this composites on top of it, matching
+            // the deferred PBR/point pattern (tcMeshPbrPipeline.h).
+            draw.layerId = wctx.fboLayerNext;
+            wctx.fboShaderDraws.push_back(std::move(draw));
+            wctx.fboLayerNext++;
+            sgl_layer(wctx.fboLayerNext);
+        } else {
+            // Swapchain: executed in present() between sokol_gl layers.
+            draw.layerId = wctx.sglLayerNext - 1;  // Layer before this shader
+            wctx.deferredShaderDraws.push_back(std::move(draw));
+        }
     }
 
 protected:
     // Sokol resources
     sg_shader shader = {};
-    sg_pipeline pipeline = {};
+    sg_pipeline pipeline = {};   // targets the swapchain (created at load())
     sg_buffer vertexBuffer = {};
     sg_buffer indexBuffer = {};
     bool loaded = false;
 
+    // Render-target-specific pipeline variants, keyed by (color format, sample
+    // count). `pipeline` above matches the swapchain; an FBO pass has a different
+    // color format / sample count / depth, so a matching pipeline is built lazily
+    // on first draw into each distinct FBO target. Using a mismatched pipeline
+    // (e.g. a swapchain BGRA8 pipeline inside an RGBA8 FBO) corrupts the output.
+    std::unordered_map<uint64_t, sg_pipeline> targetPipelines_;
+
     // Pending texture bindings
-    struct TextureBinding {
-        sg_image image;
-        sg_sampler sampler;
-    };
     struct ViewBinding {
         sg_view view;
         sg_sampler sampler;
     };
-    std::unordered_map<int, TextureBinding> pendingTextures;
     std::unordered_map<int, ViewBinding> pendingViews;
+
+    // Views created by the setTexture(slot, sg_image, sampler) convenience
+    // overload, cached per slot and released (deferred) in clear().
+    struct CachedImageView {
+        sg_image image = {};
+        sg_view view = {};
+    };
+    std::unordered_map<int, CachedImageView> imageViews_;
 
     // Pending uniform data (stored for reapplication after pipeline switch)
     std::unordered_map<int, std::vector<uint8_t>> pendingUniforms;
@@ -389,45 +396,61 @@ protected:
         desc.colors[0].blend.dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
 
         // Index buffer for quad support
-        desc.index_type = SG_INDEXTYPE_UINT16;
+        desc.index_type = SG_INDEXTYPE_UINT32;
 
         desc.label = "tc_shader_pipeline";
         return desc;
     }
 
     virtual void createVertexBuffer() {
-        // Vertex buffer for append mode (stream usage)
-        sg_buffer_desc vbufDesc = {};
-        vbufDesc.size = 65536 * sizeof(ShaderVertex);
-        vbufDesc.usage.stream_update = true;  // Enable append mode
-        vbufDesc.label = "tc_shader_vertices";
-        vertexBuffer = sg_make_buffer(&vbufDesc);
-
-        // Index buffer for append mode
-        sg_buffer_desc ibufDesc = {};
-        ibufDesc.size = 65536 * sizeof(uint16_t);
-        ibufDesc.usage.index_buffer = true;
-        ibufDesc.usage.stream_update = true;  // Enable append mode
-        ibufDesc.label = "tc_shader_indices";
-        indexBuffer = sg_make_buffer(&ibufDesc);
+        vertexBuffer = internal::makeShaderStreamBuffer(65536 * sizeof(ShaderVertex), false);
+        indexBuffer = internal::makeShaderStreamBuffer(65536 * sizeof(uint32_t), true);
+        stream_ = std::make_shared<internal::ShaderStreamState>();
     }
 
     virtual void onBegin() {}
     virtual void onEnd() {}
     virtual void setupBindings(sg_bindings& bind) {}
 
+    // Pipeline matching the current render target. The swapchain uses the
+    // load()-time `pipeline`; an FBO pass needs a pipeline whose color format,
+    // sample count and depth match the FBO, so one is built lazily (from the same
+    // createPipelineDesc()) and cached per distinct (format, sampleCount) target.
+    sg_pipeline pipelineForCurrentTarget() {
+        auto& wctx = internal::currentWindowContext();
+        if (!wctx.inFboPass) return pipeline;
+        uint64_t key = ((uint64_t)wctx.currentFboColorFormat << 8)
+                     | (uint64_t)(wctx.currentFboSampleCount & 0xff);
+        auto it = targetPipelines_.find(key);
+        if (it != targetPipelines_.end()) return it->second;
+        sg_pipeline_desc desc = createPipelineDesc();
+        desc.shader = shader;
+        desc.colors[0].pixel_format = wctx.currentFboColorFormat;
+        desc.sample_count           = wctx.currentFboSampleCount;
+        desc.depth.pixel_format     = SG_PIXELFORMAT_DEPTH_STENCIL;  // Fbo always allocates depth-stencil
+        sg_pipeline pip = sg_make_pipeline(&desc);
+        targetPipelines_[key] = pip;
+        return pip;
+    }
+
 private:
+    std::shared_ptr<internal::ShaderStreamState> stream_;
+
     void moveFrom(Shader&& other) {
         shader = other.shader;
         pipeline = other.pipeline;
         vertexBuffer = other.vertexBuffer;
         indexBuffer = other.indexBuffer;
         loaded = other.loaded;
-        pendingTextures = std::move(other.pendingTextures);
+        stream_ = std::move(other.stream_);
         pendingViews = std::move(other.pendingViews);
+        pendingUniforms = std::move(other.pendingUniforms);
+        imageViews_ = std::move(other.imageViews_);
+        targetPipelines_ = std::move(other.targetPipelines_);
 
         other.shader = {};
         other.pipeline = {};
+        other.targetPipelines_.clear();
         other.vertexBuffer = {};
         other.indexBuffer = {};
         other.loaded = false;
@@ -437,11 +460,11 @@ private:
 // ---------------------------------------------------------------------------
 // ShaderWriter::end() implementation (needs Shader class)
 // ---------------------------------------------------------------------------
-inline void ShaderWriter::end() {
+inline void internal::ShaderWriter::end() {
     Shader* shader = internal::getCurrentShader();
     if (shader && !vertices.empty()) {
         // Apply current transformation matrix to vertices
-        Mat4 mat = getCurrentMatrix();
+        Mat4 mat = getMatrix();
         for (auto& v : vertices) {
             Vec3 transformed = mat * Vec3(v.x, v.y, v.z);
             v.x = transformed.x;
@@ -468,43 +491,68 @@ inline void popShader() {
     }
 }
 
-// Reset shader stack (called at end of frame)
-inline void resetShaderStack() {
-    while (!internal::shaderStack.empty()) {
-        popShader();
-    }
-}
+// NOTE: the frame-end shader-stack reset is internal::resetShaderStack()
+// (defined in tcVertexWriter.h, called from present()). A second public
+// resetShaderStack() that drained the stack via popShader() used to live
+// here but had no callers — removed during the internal:: consolidation.
 
 // Flush deferred shader draws (called from present())
 // Draws sokol_gl layers interleaved with shader draws for correct ordering
+namespace internal {
 inline void flushDeferredShaderDraws() {
     // Check for vertex buffer overflow — skip sgl draw to avoid crash
     // (overflowed commands may contain invalid pipeline IDs)
     sgl_error_t err = sgl_error();
     bool sglOverflow = err.vertices_full || err.commands_full;
 
+    // Deferred swapchain queues + layer counter are per-window (this tick's ctx).
+    auto& wctx = internal::currentWindowContext();
+
     // For each layer: draw sokol_gl, then execute shader draws for that layer
-    for (int layer = 0; layer <= internal::sglLayerNext; layer++) {
+    for (int layer = 0; layer <= wctx.sglLayerNext; layer++) {
         // Draw sokol_gl content for this layer (skip if overflowed)
         if (!sglOverflow) {
             sgl_draw_layer(layer);
         }
 
-        // Deferred shader draws are independent of sgl, always safe
-        for (auto& draw : internal::deferredShaderDraws) {
+        // Deferred shader draws are independent of sgl, always safe. Each is a
+        // self-contained snapshot (pipeline/bindings/uniforms captured at
+        // submission), so no Shader object is touched here — the object may
+        // already be destroyed.
+        for (auto& draw : wctx.deferredShaderDraws) {
             if (draw.layerId == layer) {
-                draw.shader->executeDeferredDraw(draw.vertices, draw.type);
+                internal::executeDeferredShaderDraw(draw);
+            }
+        }
+
+        // Deferred PBR mesh draws — same per-layer ordering, so PBR composites
+        // with sokol_gl 2D in submission order (a 2D background drawn first
+        // stays behind the meshes).
+        for (auto& d : wctx.deferredPbrDraws) {
+            if (d.layerId == layer) {
+                internal::getPbrPipeline().executePbrDraw(d.cmd);
+            }
+        }
+
+        // Deferred point-splat draws (Mesh in PrimitiveMode::Points) — same
+        // per-layer ordering, sharing the swapchain pass + depth buffer.
+        for (auto& d : wctx.deferredPointDraws) {
+            if (d.layerId == layer) {
+                internal::executePointDraw(d.cmd);
             }
         }
     }
 
     // Clear deferred draws for next frame
-    internal::deferredShaderDraws.clear();
+    wctx.deferredShaderDraws.clear();
+    wctx.deferredPbrDraws.clear();
+    wctx.deferredPointDraws.clear();
 
     // Reset layer for next frame
-    internal::sglLayerNext = 0;
+    wctx.sglLayerNext = 0;
     sgl_layer(0);
 }
+} // namespace internal
 
 // ---------------------------------------------------------------------------
 // FullscreenShader - Fullscreen effect shader (position + texcoord layout)
@@ -530,11 +578,18 @@ public:
         // Flush sokol_gl so it draws before the fullscreen quad
         sgl_draw();
 
-        sg_apply_pipeline(pipeline);
+        // Match the pipeline to the current target (swapchain vs FBO format).
+        sg_apply_pipeline(pipelineForCurrentTarget());
 
         sg_bindings bind = {};
         bind.vertex_buffers[0] = vertexBuffer;
         bind.index_buffer = indexBuffer;
+        // Apply inputs set via setTexture(slot, view, sampler), so a plain
+        // FullscreenShader can sample a source without a setupBindings() override.
+        for (auto& [slot, v] : pendingViews) {
+            bind.views[slot] = v.view;
+            bind.samplers[slot] = v.sampler;
+        }
         setupBindings(bind);
         sg_apply_bindings(&bind);
 
@@ -546,13 +601,31 @@ public:
 
         sg_draw(0, 6, 1);
 
-        // Restore sokol_gl state
+        // Restore sokol_gl state to what the rest of the frame expects.
+        //
+        // Inside an Fbo pass that is the corner-origin ortho Fbo::begin set up.
+        // On the SWAPCHAIN the screen convention is NOT a corner ortho — it is
+        // the screen camera from setupScreenFovWithSize (a CENTERED projection
+        // plus a lookat modelview; perspective when defaultScreenFov > 0). A
+        // plain ortho here leaves a mixed state: as soon as the engine
+        // re-applies the camera modelview, later 2D draws land shifted by
+        // (-W/2, -H/2) at the wrong scale. (Historic bug: this used
+        // sapp_width(), physical px, which additionally halved everything on
+        // retina.) Re-run the real setup with the CURRENT view params instead.
         sg_reset_state_cache();
-        sgl_defaults();
-        sgl_matrix_mode_projection();
-        sgl_ortho(0.0f, (float)sapp_width(), (float)sapp_height(), 0.0f, -10000.0f, 10000.0f);
-        sgl_matrix_mode_modelview();
-        sgl_load_identity();
+        auto& wctx = internal::currentWindowContext();
+        if (wctx.inFboPass) {
+            sgl_defaults();
+            internal::loadPipeline(internal::activeFill2D());
+            internal::sglLoadProjection(
+                internal::screen2DProjection(wctx.currentViewW, wctx.currentViewH));
+            sgl_matrix_mode_modelview();
+            sgl_load_identity();
+        } else {
+            internal::setupScreenFovWithSize(wctx.currentScreenFov,
+                                             wctx.currentViewW, wctx.currentViewH,
+                                             0.0f, 0.0f);
+        }
     }
 
 protected:
@@ -563,10 +636,12 @@ protected:
         desc.layout.attrs[0].format = SG_VERTEXFORMAT_FLOAT2;  // position
         desc.layout.attrs[1].format = SG_VERTEXFORMAT_FLOAT2;  // texcoord
 
-        // Default alpha blending
-        desc.colors[0].blend.enabled = true;
-        desc.colors[0].blend.src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA;
-        desc.colors[0].blend.dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+        // A fullscreen pass covers the whole target, so OVERWRITE by default (no
+        // blend). Blending would composite over existing content — and for a
+        // premultiplied-alpha source (e.g. blurring an FBO) it re-premultiplies
+        // every pass, darkening/desaturating the result. Subclasses that need to
+        // composite can override this to enable blending.
+        desc.colors[0].blend.enabled = false;
 
         // Index buffer for quad
         desc.index_type = SG_INDEXTYPE_UINT16;

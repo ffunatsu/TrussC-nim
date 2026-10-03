@@ -1,4 +1,5 @@
 #pragma once
+#include "tc/utils/tcAnnotations.h"
 
 // =============================================================================
 // tcVideoPlayer.h - Video playback
@@ -25,10 +26,12 @@
 
 namespace trussc {
 
+namespace internal { class VideoPlayerPlatformAccess; }  // friend, defined below
+
 // ---------------------------------------------------------------------------
 // VideoPlayer - Standard video playback (RGBA output)
 // ---------------------------------------------------------------------------
-class VideoPlayer : public VideoPlayerBase {
+class TC_PLATFORMS("macos,windows,linux,ios,web") VideoPlayer : public VideoPlayerBase {
 public:
     VideoPlayer() = default;
     ~VideoPlayer() { close(); }
@@ -50,18 +53,39 @@ public:
     // Load / Close
     // =========================================================================
 
-    bool load(const std::string& path) override {
+    LoadResult load(const fs::path& path) override {
         if (initialized_) {
             close();
         }
 
-        // Resolve relative paths via getDataPath
-        std::string resolvedPath = getDataPath(path);
+        // Resolve relative paths via getDataPath; URLs pass through untouched
+        // (the web backend streams straight from them). UTF-8, not
+        // path.string(): that throws on Windows for names outside the code page.
+        const std::string pathStr = pathToUtf8(path);
+        bool isUrl = pathStr.rfind("http://", 0) == 0 || pathStr.rfind("https://", 0) == 0;
+        fs::path resolvedPath = isUrl ? path : getDataPath(path);
+
+        // Missing files are classified up front (URLs skip the check —
+        // the platform backends stream straight from them).
+        if (!isUrl) {
+            std::error_code ec;
+            if (!fs::exists(resolvedPath, ec)) {
+                logError("VideoPlayer") << "file not found: " << internal::pathToUtf8(resolvedPath);
+                return LoadResult::fail(LoadError::FileNotFound,
+                                        "file not found: " + internal::pathToUtf8(resolvedPath));
+            }
+        }
 
         // Platform-specific load
         if (!loadPlatform(resolvedPath)) {
-            return false;
+            return LoadResult::fail(LoadError::DecodeFailed,
+                                    "platform decoder failed to open: " +
+                                    internal::pathToUtf8(resolvedPath));
         }
+
+        // Remember the resolved path so instance-level frame extraction
+        // (extractFrame / extractKeyFrame with no path arg) and getPath() work.
+        sourcePath_ = resolvedPath;
 
         // Create texture(s) for per-frame updates
         if (width_ > 0 && height_ > 0) {
@@ -79,13 +103,21 @@ public:
                 }
             } else {
                 texture_.allocate(width_, height_, 4, TextureUsage::Stream);
-                clearTexture();
             }
         }
 
         initialized_ = true;
         firstFrameReceived_ = false;
-        return true;
+        posterActive_ = false;
+
+        // Auto poster: synchronously put frame 0 on the texture so drawing
+        // never shows black between load() and the first decoded frame.
+        // Frame 0 is always a keyframe, so this is exact AND fast.
+        // Stream textures accept ONE loadData per frame, so the poster and
+        // the black-clear are alternatives, never both.
+        bool postered = autoPoster_ && loadPosterFrame(0.0f);
+        if (!postered) clearTexture();
+        return LoadResult::success();
     }
 
     void close() override {
@@ -108,9 +140,16 @@ public:
         paused_ = false;
         frameNew_ = false;
         firstFrameReceived_ = false;
+        posterActive_ = false;
+        posterUploadPending_ = false;
+        posterPx_.clear();
+        texUploadFrame_ = ~0ull;
+        lastShownTime_ = -1.0f;
+        pendingSeekSec_ = -1.0f;
         done_ = false;
         width_ = 0;
         height_ = 0;
+        sourcePath_.clear();
     }
 
     // =========================================================================
@@ -137,8 +176,21 @@ public:
             } else {
                 if (pixels_ && width_ > 0 && height_ > 0) {
                     texture_.loadData(pixels_, width_, height_, 4);
+                    texUploadFrame_ = sapp_frame_count();
                     markFrameNew();
                 }
+            }
+        }
+
+        // A live frame replaces the poster; free the temporary poster
+        // texture in NV12 mode (the shader path takes over). Track what
+        // moment the picture on the texture belongs to (poster decisions).
+        if (frameNew_) {
+            lastShownTime_ = getCurrentTime();
+            pendingSeekSec_ = -1.0f;  // live playback reflects the position now
+            if (posterActive_) {
+                posterActive_ = false;
+                if (nv12Mode_) texture_.clear();
             }
         }
 
@@ -146,7 +198,52 @@ public:
         if (playing_ && !paused_ && isFinishedPlatform()) {
             markDone();
         }
+
+        // Deferred poster upload: the poster from stop()/seek+play() could not
+        // use this texture's once-per-frame upload slot when it was requested
+        // (a live frame had it). A live frame arriving now supersedes it;
+        // otherwise the slot is free on this fresh frame - upload for real so
+        // the picture on screen matches the playback position.
+        if (posterUploadPending_) {
+            if (frameNew_) {
+                posterUploadPending_ = false;
+                posterPx_.clear();
+            } else if (posterPx_.isAllocated() && texture_.isAllocated()
+                       && texUploadFrame_ != sapp_frame_count()) {
+                texture_.loadData(posterPx_.getData(), width_, height_, 4);
+                texUploadFrame_ = sapp_frame_count();
+                posterUploadPending_ = false;
+                posterPx_.clear();
+            }
+        }
     }
+
+    // =========================================================================
+    // Playback (auto poster on play)
+    // =========================================================================
+
+    void play() override {
+        // Invariant: the texture always shows the frame AT the playback
+        // position. If the position moved while stopped/paused (seek) or the
+        // texture is still empty, bridge with the exact frame synchronously
+        // so playback never starts on black or on a stale picture.
+        if (autoPoster_ && initialized_) {
+            float t = (pendingSeekSec_ >= 0.0f) ? pendingSeekSec_ : getCurrentTime();
+            if (!firstFrameReceived_ || fabsf(t - lastShownTime_) > 0.05f) {
+                loadPosterFrame(t);
+            }
+        }
+        VideoPlayerBase::play();
+    }
+
+    // Auto poster (default ON): on load()/play(), synchronously extract the
+    // frame at the current position and show it until live frames arrive, so
+    // the player never draws its cleared (black) texture. Turn off if the
+    // one-time synchronous decode at load/play is undesirable. No effect on
+    // platforms without frame extraction (Android/web - web bridges via the
+    // <video> element instead).
+    void setAutoPoster(bool on) { autoPoster_ = on; }
+    bool getAutoPoster() const { return autoPoster_; }
 
     // =========================================================================
     // Draw (NV12 path uses shader; RGBA path uses default HasTexture::draw)
@@ -158,7 +255,9 @@ public:
 
     void draw(float x, float y, float w, float h) const override {
 #if defined(__linux__) && !defined(__ANDROID__)
-        if (nv12Mode_ && nv12ShaderHandle_) {
+        // While the poster is up, draw it even in NV12 mode (the poster is an
+        // RGBA texture; the Y/UV planes still hold priming data).
+        if (nv12Mode_ && nv12ShaderHandle_ && !posterActive_) {
             drawNV12Platform(x, y, w, h);
             return;
         }
@@ -257,10 +356,10 @@ public:
     // =========================================================================
 
     bool hasAudio() const override { return hasAudioPlatform(); }
-    uint32_t getAudioCodec() const override { return getAudioCodecPlatform(); }
-    std::vector<uint8_t> getAudioData() const override { return getAudioDataPlatform(); }
-    int getAudioSampleRate() const override { return getAudioSampleRatePlatform(); }
-    int getAudioChannels() const override { return getAudioChannelsPlatform(); }
+    TC_PLATFORMS("macos,windows,linux,ios") uint32_t getAudioCodec() const override { return getAudioCodecPlatform(); }
+    TC_PLATFORMS("macos,windows,linux,ios") std::vector<uint8_t> getAudioData() const override { return getAudioDataPlatform(); }
+    TC_PLATFORMS("macos,windows,linux,ios") int getAudioSampleRate() const override { return getAudioSampleRatePlatform(); }
+    TC_PLATFORMS("macos,windows,linux,ios") int getAudioChannels() const override { return getAudioChannelsPlatform(); }
 
     // =========================================================================
     // Hardware acceleration info
@@ -268,6 +367,11 @@ public:
 
     bool isUsingHwAccel() const override { return isUsingHwAccelPlatform(); }
     std::string getHwAccelName() const override { return getHwAccelNamePlatform(); }
+
+    /// Path of the currently loaded video file (empty string when not loaded).
+    /// This is the resolved path (relative paths passed to load() are resolved
+    /// via getDataPath), as UTF-8.
+    fs::path getPath() const { return sourcePath_; }
 
 protected:
     // -------------------------------------------------------------------------
@@ -280,7 +384,13 @@ protected:
 
     void stopImpl() override {
         stopPlatform();
-        clearTexture();
+        // stop() rewinds to the beginning, so put frame 0 on the texture:
+        // the picture always matches the playback position, and a following
+        // play() starts from an already-correct image (no black, no stale
+        // frame). Platforms without extraction keep the last frame until the
+        // element/decoder surfaces frame 0 itself.
+        pendingSeekSec_ = -1.0f;
+        if (autoPoster_) loadPosterFrame(0.0f);
     }
 
     void setPausedImpl(bool paused) override {
@@ -289,6 +399,10 @@ protected:
 
     void setPositionImpl(float pct) override {
         setPositionPlatform(pct);
+        // Seeks are async on most backends, so getCurrentTime() right after a
+        // seek still returns the OLD position. Remember the target: the
+        // poster logic in play() uses it until a live frame supersedes it.
+        pendingSeekSec_ = pct * getDurationPlatform();
     }
 
     void setVolumeImpl(float vol) override {
@@ -319,6 +433,13 @@ private:
     Texture textureY_;
     Texture textureUV_;
     bool  nv12Mode_       = false;
+    bool  autoPoster_     = true;   // extract-and-show a poster on load/play
+    bool  posterActive_   = false;  // poster currently on texture_ (until live)
+    Pixels posterPx_;               // poster awaiting upload (deferred one frame)
+    bool  posterUploadPending_ = false;  // upload posterPx_ on the next update()
+    uint64_t texUploadFrame_ = ~0ull;    // sapp frame of the last texture_ upload
+    float lastShownTime_  = -1.0f;  // time (sec) of the picture on the texture
+    float pendingSeekSec_ = -1.0f;  // seek target awaiting playback (-1 = none)
     void* nv12ShaderHandle_ = nullptr;  // NV12VideoShader* on Linux/CUDA
 
     // Gamma correction (1.0 = none)
@@ -329,6 +450,10 @@ private:
 
     // Platform-specific handle
     void* platformHandle_ = nullptr;
+
+    // Resolved path of the currently loaded video (empty when not loaded).
+    // Used by getPath() and the instance-level frame-extraction overloads.
+    fs::path sourcePath_;
 
     // -------------------------------------------------------------------------
     // Internal methods
@@ -353,12 +478,22 @@ private:
         textureY_  = std::move(other.textureY_);
         textureUV_ = std::move(other.textureUV_);
         nv12Mode_        = other.nv12Mode_;
+        autoPoster_      = other.autoPoster_;
+        posterActive_    = other.posterActive_;
+        posterPx_        = std::move(other.posterPx_);
+        posterUploadPending_ = other.posterUploadPending_;
+        texUploadFrame_  = other.texUploadFrame_;
+        lastShownTime_   = other.lastShownTime_;
+        pendingSeekSec_  = other.pendingSeekSec_;
         nv12ShaderHandle_ = other.nv12ShaderHandle_;
         platformHandle_  = other.platformHandle_;
+        sourcePath_      = std::move(other.sourcePath_);
 
         other.pixels_    = nullptr;
         other.pixelsY_   = nullptr;
         other.pixelsUV_  = nullptr;
+        other.posterUploadPending_ = false;
+        other.texUploadFrame_      = ~0ull;
         other.nv12Mode_        = false;
         other.nv12ShaderHandle_ = nullptr;
         other.initialized_     = false;
@@ -368,18 +503,61 @@ private:
     }
 
     // Clear texture to black (prevents old frame from showing)
+    // Extract the frame at timeSec and put it on texture_ as a poster.
+    // timeSec <= 0 uses the keyframe path (frame 0 is a keyframe: exact+fast).
+    // Marks the player ready (isReady) - drawing now shows a real picture.
+    // Returns false when extraction is unavailable/failed (caller clears).
+    bool loadPosterFrame(float timeSec) {
+        if (sourcePath_.empty() || width_ <= 0 || height_ <= 0) return false;
+        Pixels px;
+        bool ok = (timeSec <= 0.001f)
+                      ? extractKeyFramePlatform(sourcePath_, px, 0.0f, nullptr)
+                      : extractFramePlatform(sourcePath_, px, timeSec, nullptr);
+        if (!ok || px.getWidth() != width_ || px.getHeight() != height_) return false;
+        bool freshTexture = !texture_.isAllocated();
+        if (freshTexture) {
+            texture_.allocate(width_, height_, 4, TextureUsage::Stream);
+        }
+        {
+            // keep the CPU mirror in sync so getPixels() matches what is shown
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pixels_) {
+                std::memcpy(pixels_, px.getData(), (size_t)width_ * height_ * 4);
+            }
+        }
+        // texture_ accepts ONE loadData per app frame (sokol). During playback
+        // the live frame usually took this frame's slot already, so uploading
+        // now would be silently dropped and the screen would keep the stale
+        // frame. Defer to the next update() in that case (the slot is free
+        // there - or a new live frame supersedes the poster anyway).
+        if (freshTexture || texUploadFrame_ != sapp_frame_count()) {
+            texture_.loadData(px.getData(), width_, height_, 4);
+            texUploadFrame_ = sapp_frame_count();
+            posterUploadPending_ = false;
+            posterPx_.clear();
+        } else {
+            posterPx_ = std::move(px);
+            posterUploadPending_ = true;
+        }
+        posterActive_ = true;
+        lastShownTime_ = timeSec;    // the picture now belongs to this moment
+        firstFrameReceived_ = true;  // isReady: a real picture is on the texture
+        return true;
+    }
+
     void clearTexture() {
         if (width_ > 0 && height_ > 0 && pixels_) {
             std::lock_guard<std::mutex> lock(mutex_);
             std::memset(pixels_, 0, width_ * height_ * 4);
             texture_.loadData(pixels_, width_, height_, 4);
+            texUploadFrame_ = sapp_frame_count();
         }
     }
 
     // -------------------------------------------------------------------------
     // Platform-specific methods (implemented in tcVideoPlayer_mac.mm, etc.)
     // -------------------------------------------------------------------------
-    bool loadPlatform(const std::string& path);
+    bool loadPlatform(const fs::path& path);
     void closePlatform();
     void playPlatform();
     void stopPlatform();
@@ -415,32 +593,125 @@ private:
     std::string getHwAccelNamePlatform() const;
 
     // =========================================================================
-    // Static utility — frame extraction (thread-safe, no GPU required)
+    // Frame extraction (thread-safe, no GPU required)
+    //
+    // extractFrame    — the EXACT frame displayed at timeSec. Seeks to the
+    //                   preceding keyframe then decodes forward to timeSec.
+    //                   Slightly heavier, but frame-accurate on every platform.
+    // extractKeyFrame — the NEAREST keyframe at or before timeSec. Seek only,
+    //                   no forward decode, so it is faster but time-approximate.
+    //                   Falls back to an exact decode if no keyframe is reachable.
+    //
+    // Both come in a static form (give a path, no load() needed — good for
+    // thumbnails) and an instance form (uses the currently loaded getPath()).
+    // These are single-shot helpers: do NOT use them for continuous playback
+    // (each call opens its own decode context). For playback use load()/play().
     // =========================================================================
 public:
-    /// Extract a single frame as RGBA pixels from a video file.
+    /// Extract the exact frame at a time from a video file (static).
     /// @param path      Video file path
     /// @param outPixels Receives the extracted frame (RGBA U8)
-    /// @param timeSec   Time in seconds to extract from (default 1.0)
+    /// @param timeSec   Time in seconds to extract from
     /// @param outDuration If non-null, receives video duration in seconds
     /// @return true on success
-    static bool extractFrame(const std::string& path, Pixels& outPixels,
-                             float timeSec = 1.0f, float* outDuration = nullptr) {
+    static bool extractFrame(const fs::path& path, Pixels& outPixels,
+                             float timeSec, float* outDuration = nullptr) {
         return extractFramePlatform(path, outPixels, timeSec, outDuration);
     }
 
+    /// Extract the nearest keyframe at or before a time (static, faster).
+    /// The returned frame's real time may be earlier than timeSec.
+    /// @param path      Video file path
+    /// @param outPixels Receives the extracted frame (RGBA U8)
+    /// @param timeSec   Upper-bound time in seconds
+    /// @param outDuration If non-null, receives video duration in seconds
+    /// @return true on success
+    static bool extractKeyFrame(const fs::path& path, Pixels& outPixels,
+                                float timeSec, float* outDuration = nullptr) {
+        return extractKeyFramePlatform(path, outPixels, timeSec, outDuration);
+    }
+
+    /// Extract the exact frame at a time from the currently loaded video
+    /// (instance). Returns false if no video is loaded.
+    bool extractFrame(Pixels& outPixels, float timeSec,
+                      float* outDuration = nullptr) const {
+        if (sourcePath_.empty()) return false;
+        return extractFramePlatform(sourcePath_, outPixels, timeSec, outDuration);
+    }
+
+    /// Extract the nearest keyframe at or before a time from the currently
+    /// loaded video (instance, faster). Returns false if no video is loaded.
+    bool extractKeyFrame(Pixels& outPixels, float timeSec,
+                         float* outDuration = nullptr) const {
+        if (sourcePath_.empty()) return false;
+        return extractKeyFramePlatform(sourcePath_, outPixels, timeSec, outDuration);
+    }
+
+    // -------------------------------------------------------------------------
+    // Image convenience overloads. Same extraction, but the result lands in a
+    // ready-to-draw Image (allocate + texture upload included). GPU upload =>
+    // MAIN THREAD ONLY; use the Pixels overloads for background work.
+    // -------------------------------------------------------------------------
+
+    /// Extract the exact frame at a time into a ready-to-draw Image (static).
+    static bool extractFrame(const fs::path& path, Image& outImage,
+                             float timeSec, float* outDuration = nullptr) {
+        Pixels px;
+        if (!extractFramePlatform(path, px, timeSec, outDuration)) return false;
+        pixelsToImage(px, outImage);
+        return true;
+    }
+
+    /// Extract the nearest keyframe at or before a time into a ready-to-draw
+    /// Image (static, faster).
+    static bool extractKeyFrame(const fs::path& path, Image& outImage,
+                                float timeSec, float* outDuration = nullptr) {
+        Pixels px;
+        if (!extractKeyFramePlatform(path, px, timeSec, outDuration)) return false;
+        pixelsToImage(px, outImage);
+        return true;
+    }
+
+    /// Extract the exact frame from the currently loaded video into a
+    /// ready-to-draw Image (instance). Returns false if no video is loaded.
+    bool extractFrame(Image& outImage, float timeSec,
+                      float* outDuration = nullptr) const {
+        if (sourcePath_.empty()) return false;
+        return extractFrame(sourcePath_, outImage, timeSec, outDuration);
+    }
+
+    /// Extract the nearest keyframe from the currently loaded video into a
+    /// ready-to-draw Image (instance, faster). Returns false if no video is loaded.
+    bool extractKeyFrame(Image& outImage, float timeSec,
+                         float* outDuration = nullptr) const {
+        if (sourcePath_.empty()) return false;
+        return extractKeyFrame(sourcePath_, outImage, timeSec, outDuration);
+    }
+
 private:
-    static bool extractFramePlatform(const std::string& path, Pixels& outPixels,
+    // Move extracted pixels into a drawable Image (allocate + upload).
+    static void pixelsToImage(const Pixels& px, Image& img) {
+        img.allocate(px.getWidth(), px.getHeight(), 4);
+        std::memcpy(img.getPixelsData(), px.getData(),
+                    (size_t)px.getWidth() * px.getHeight() * 4);
+        img.setDirty();
+        img.update();
+    }
+
+    static bool extractFramePlatform(const fs::path& path, Pixels& outPixels,
                                      float timeSec, float* outDuration);
+    static bool extractKeyFramePlatform(const fs::path& path, Pixels& outPixels,
+                                        float timeSec, float* outDuration);
 
     // Allow platform implementations to access internals
-    friend class VideoPlayerPlatformAccess;
+    friend class internal::VideoPlayerPlatformAccess;
 
 #if defined(__linux__) && !defined(__ANDROID__)
     void drawNV12Platform(float x, float y, float w, float h) const;
 #endif
 };
 
+namespace internal {
 // Helper class for platform implementations to access protected members
 class VideoPlayerPlatformAccess {
 public:
@@ -461,5 +732,6 @@ public:
         return player.mutex_;
     }
 };
+} // namespace internal
 
 } // namespace trussc

@@ -9,6 +9,10 @@
 //
 // =============================================================================
 
+#include "../gpu/tcShaderStream.h"
+
+#include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace trussc {
@@ -16,24 +20,10 @@ namespace trussc {
 // Forward declaration
 class Shader;
 
-// ---------------------------------------------------------------------------
-// Standard vertex format for shader drawing
-// ---------------------------------------------------------------------------
-struct ShaderVertex {
-    float x, y, z;      // position
-    float u, v;         // texcoord
-    float r, g, b, a;   // color
-};
-
-// Primitive types
-enum class PrimitiveType {
-    Points,
-    Lines,
-    LineStrip,
-    Triangles,
-    TriangleStrip,
-    Quads
-};
+// The writer classes and shader-stack plumbing below are framework
+// internals. Draw functions reach them via internal::getActiveWriter();
+// ShaderVertex / PrimitiveType above stay public (shader-authoring API).
+namespace internal {
 
 // ---------------------------------------------------------------------------
 // VertexWriter interface - abstraction for sokol_gl vs shader drawing
@@ -128,40 +118,33 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Deferred shader draw - for proper draw ordering
+// Vertex writers (shared scratch — stateless singletons) and the per-window
+// shader-stack / layer-counter / deferred-draw accessors.
 // ---------------------------------------------------------------------------
-struct DeferredShaderDraw {
-    int layerId;                        // sokol_gl layer before this draw
-    Shader* shader;                     // shader to use
-    std::vector<ShaderVertex> vertices; // vertex data
-    PrimitiveType type;                 // primitive type
-};
-
-// ---------------------------------------------------------------------------
-// Global shader stack and vertex writers
-// ---------------------------------------------------------------------------
-namespace internal {
-    inline std::vector<Shader*> shaderStack;
+    // A per-module copy is harmless: SglWriter has no state, and ShaderWriter's
+    // vertices are scratch that one draw call fills and flushes (begin() to
+    // end()) inside a single function.
     inline SglWriter sglWriter;
     inline ShaderWriter shaderWriter;
 
-    // sokol_gl layer management for proper draw ordering with shaders
-    // Each pushShader() increments this, so post-shader draws go to a new layer
-    inline int sglLayerNext = 0;
-
-    // Deferred shader draws - executed in present() for proper ordering
-    inline std::vector<DeferredShaderDraw> deferredShaderDraws;
+    // The shader stack, sokol_gl layer counter (sglLayerNext), and the deferred
+    // swapchain/FBO draw queues are now PER-WINDOW: they live in WindowContext
+    // (tc/app/tcWindowContext.h) and are reached through currentWindowContext().
+    // They used to be process globals here — moved so no per-frame draw/record
+    // state is shared between windows (each window ticks serially, populating
+    // and draining its own queues within one tick).
 
     inline Shader* getCurrentShader() {
-        return shaderStack.empty() ? nullptr : shaderStack.back();
+        auto& s = currentWindowContext().shaderStack;
+        return s.empty() ? nullptr : s.back();
     }
 
     inline bool isShaderActive() {
-        return !shaderStack.empty();
+        return !currentWindowContext().shaderStack.empty();
     }
 
     inline void resetShaderStack() {
-        shaderStack.clear();
+        currentWindowContext().shaderStack.clear();
     }
 
     inline VertexWriter& getActiveWriter() {

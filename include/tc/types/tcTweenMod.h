@@ -222,6 +222,15 @@ public:
         return *this;
     }
 
+    // Custom ease: user-supplied curve (may capture state). Default mode In
+    // applies the function as authored; Out/InOut derive from an ease-in curve.
+    TweenMod& ease(EaseFunction fn, EaseMode mode = EaseMode::In) {
+        customEase_ = std::move(fn);
+        easeType_ = EaseType::Custom;
+        easeMode_ = mode;
+        return *this;
+    }
+
     TweenMod& delay(float seconds) {
         delay_ = seconds;
         return *this;
@@ -267,6 +276,32 @@ public:
         if (duration_ <= 0.0f) return 1.0f;
         return std::max(0.0f, std::min(elapsed_ / duration_, 1.0f));
     }
+    float getDuration() const { return duration_; }
+    float getDelay() const { return delay_; }
+    EaseType getEaseType() const { return easeType_; }
+    EaseMode getEaseMode() const { return easeMode_; }
+
+    // -------------------------------------------------------------------------
+    // Reflection
+    // -------------------------------------------------------------------------
+    // Timing + easing are editable (even mid-tween); playback state is shown
+    // read-only. Targets are not reflected — they only mean something together
+    // with their enabled/relative flags, i.e. through the builder calls.
+    TC_REFLECT(TweenMod, Mod) {
+        TC_VALUE(duration, getDuration, duration)
+        TC_VALUE(delay, getDelay, delay)
+        TC_VALUE(easeType, getEaseType, setEaseType)
+        TC_VALUE(easeMode, getEaseMode, setEaseMode)
+        TC_VALUE(playing, isPlaying)            // no setter = read-only
+        TC_VALUE(progress, getProgress)         // no setter = read-only
+    }
+
+private:
+    // Single-value setters for reflection (ease() sets both at once).
+    void setEaseType(EaseType t) { easeType_ = t; }
+    void setEaseMode(EaseMode m) { easeMode_ = m; }
+
+public:
 
 protected:
     // -------------------------------------------------------------------------
@@ -285,7 +320,9 @@ protected:
         if (elapsed_ < 0) return;
 
         float t = getProgress();
-        float easedT = trussc::ease(t, easeType_, easeMode_);
+        float easedT = (easeType_ == EaseType::Custom)
+            ? trussc::ease(t, customEase_, easeMode_)   // null fn -> linear
+            : trussc::ease(t, easeType_, easeMode_);
 
         // Apply position
         if (posEnabled_) {
@@ -420,6 +457,7 @@ private:
     float elapsed_ = 0.0f;
     EaseType easeType_ = EaseType::Cubic;
     EaseMode easeMode_ = EaseMode::InOut;
+    EaseFunction customEase_;
     bool playing_ = false;
     bool completed_ = false;
 

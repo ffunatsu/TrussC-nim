@@ -1,4 +1,5 @@
 #pragma once
+#include "tc/utils/tcAnnotations.h"
 
 // =============================================================================
 // tcUdpSocket.h - UDP socket
@@ -13,6 +14,7 @@
 #include "../events/tcEvent.h"
 #include "../events/tcEventListener.h"
 #include "../utils/tcLog.h"
+#include "tcKeptThreads.h"
 
 // Platform-specific socket type
 #ifdef _WIN32
@@ -47,13 +49,41 @@ struct UdpErrorEventArgs {
 // ---------------------------------------------------------------------------
 // UdpSocket - UDP socket class
 // ---------------------------------------------------------------------------
-class UdpSocket {
+class TC_PLATFORMS("macos,windows,linux,android,ios") UdpSocket {
 public:
     // Events
+    //
+    // THREADING: when the receive thread is active (bind() default), onReceive
+    // fires ON THE RECEIVE THREAD, not the main thread. onError fires on
+    // whichever thread the failing call ran on (receive thread for receive
+    // errors, the caller's thread for send/bind/connect errors). A listener
+    // that touches the Node tree, GPU resources, or unguarded app state must
+    // opt into main-thread delivery:
+    //
+    //   listener = socket.onReceive.listen(fn, Deliver::Main);
+    //
+    // Deliver::Main copies the payload and runs the listener at the start of
+    // the next frame (see tcEvent.h). Plain listen(fn) runs inline on the
+    // receive thread — fastest, but you handle the synchronization.
+    // With setUseThread(false) everything runs on the main thread and this
+    // does not apply.
+    //
+    // An inline onReceive listener may call stopReceiving() or close(). The
+    // receive thread cannot join itself there: the socket keeps it, and the
+    // next startReceiving(), stopReceiving() or close() on another thread,
+    // or the destructor, waits for it (the rest of the listener). The
+    // destructor must not run on the receive thread itself (a listener that
+    // destroys the socket): it detaches the thread, which then returns from
+    // the listener into the destroyed socket, undefined behavior. Destroy it
+    // from another thread, or once the listener has returned.
     Event<UdpReceiveEventArgs> onReceive;   // On data receive
     Event<UdpErrorEventArgs> onError;       // On error
 
     UdpSocket();
+
+    // Closes the socket and returns once the receive thread has ended, one
+    // that a listener's stopReceiving() or close() let go of included. Must
+    // not run on the receive thread (see onReceive).
     ~UdpSocket();
 
     // Copy prohibited
@@ -78,7 +108,12 @@ public:
     // Set destination (after setting, can send via send(data, size))
     bool connect(const std::string& host, int port);
 
-    // Close socket
+    // Close socket. Returns once the receive thread has ended (see
+    // onReceive for a call on that thread itself).
+    // startReceiving() (bind() calls it), stopReceiving(), close() and the
+    // destructor can wait for a listener still running on the receive
+    // thread. Do not call them while holding a lock that such a listener
+    // takes: the call and the listener would wait for each other forever.
     void close();
 
     // -------------------------------------------------------------------------
@@ -105,7 +140,12 @@ public:
     // Start receive thread (called automatically after bind)
     void startReceiving();
 
-    // Stop receive thread
+    // Stop receive thread. Returns once it has ended (see onReceive for a
+    // call on that thread itself).
+    // startReceiving() (bind() calls it), stopReceiving(), close() and the
+    // destructor can wait for a listener still running on the receive
+    // thread. Do not call them while holding a lock that such a listener
+    // takes: the call and the listener would wait for each other forever.
     void stopReceiving();
 
     // Whether receiving
@@ -123,6 +163,41 @@ public:
 
     // Allow reuse (set before bind)
     bool setReuseAddress(bool enable);
+
+    // Allow several sockets to bind the SAME port (set before bind). Needed when
+    // multiple listeners share one multicast port — e.g. sACN/E1.31 on UDP 5568,
+    // where another app (a console, QLC+) may also be bound. Maps to SO_REUSEPORT
+    // on POSIX; on Windows SO_REUSEADDR already grants this, so it maps to that.
+    bool setReusePort(bool enable);
+
+    // -------------------------------------------------------------------------
+    // Multicast (IPv4)
+    // -------------------------------------------------------------------------
+    // Multicast addresses live in 224.0.0.0/4 (e.g. sACN/E1.31 uses
+    // 239.255.x.x). SENDING to a group needs no membership — just sendTo() the
+    // group address (optionally pick the outgoing NIC with
+    // setMulticastInterface() / cap the hop count with setMulticastTTL()).
+    // RECEIVING multicast requires joining the group AFTER bind() so the OS
+    // delivers that group's datagrams to this socket.
+
+    // Join a multicast group so this socket receives its datagrams. Call after
+    // bind(). interfaceAddr selects which NIC to receive on (""/"0.0.0.0" =
+    // default route). Joining the same group on several interfaces is allowed.
+    bool joinMulticastGroup(const std::string& groupAddr, const std::string& interfaceAddr = "");
+
+    // Stop receiving a previously joined group (sockets auto-leave on close()).
+    bool leaveMulticastGroup(const std::string& groupAddr, const std::string& interfaceAddr = "");
+
+    // Hop limit for OUTGOING multicast. Default 1 = stay on the local subnet
+    // (the usual lighting-network case). Raise to cross routers.
+    bool setMulticastTTL(int ttl);
+
+    // Whether OUTGOING multicast loops back to local listeners on this host.
+    // Default on (lets a sender + receiver in the same process see each other).
+    bool setMulticastLoopback(bool enable);
+
+    // Pick the NIC used for OUTGOING multicast (""/"0.0.0.0" = default route).
+    bool setMulticastInterface(const std::string& interfaceAddr);
 
     // Set receive buffer size
     bool setReceiveBufferSize(int size);
@@ -161,6 +236,12 @@ private:
 
     // Receive thread
     std::thread receiveThread_;
+
+    // receiveThread_ when a call on that very thread (a listener's
+    // stopReceiving() or close(), or the destructor) let go of it. Joined by
+    // the next startReceiving(), stopReceiving() or close() on another
+    // thread, or by the destructor (see tcKeptThreads.h).
+    internal::KeptThreads keptThreads_;
     std::atomic<bool> receiving_{false};
     std::atomic<bool> shouldStop_{false};
     
@@ -173,10 +254,6 @@ private:
 
     // Receive buffer size
     static constexpr size_t RECEIVE_BUFFER_SIZE = 65536;
-
-    // Winsock initialization (Windows)
-    static bool initWinsock();
-    static bool winsockInitialized_;
 };
 
 } // namespace trussc

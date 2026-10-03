@@ -3,7 +3,9 @@
 // =============================================================================
 
 #include "tc/network/tcUdpSocket.h"
+#include "tc/network/tcSocketInternal.h"
 
+#include <chrono>
 #include <cstring>
 
 #ifdef _WIN32
@@ -28,32 +30,11 @@
 
 namespace trussc {
 
-// Winsock initialization flag
-bool UdpSocket::winsockInitialized_ = false;
-
-// ---------------------------------------------------------------------------
-// Winsock initialization (Windows)
-// ---------------------------------------------------------------------------
-bool UdpSocket::initWinsock() {
-#ifdef _WIN32
-    if (!winsockInitialized_) {
-        WSADATA wsaData;
-        int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-        if (result != 0) {
-            logError() << "WSAStartup failed: " << result;
-            return false;
-        }
-        winsockInitialized_ = true;
-    }
-#endif
-    return true;
-}
-
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
 UdpSocket::UdpSocket() {
-    initWinsock();
+    internal::ensureWinsock();
 #ifdef __EMSCRIPTEN__
     useThread_ = false;
 #endif
@@ -212,10 +193,11 @@ void UdpSocket::close() {
         socket_ = INVALID_SOCKET_HANDLE;
     }
 
-    // Wait for thread to finish
-    if (receiveThread_.joinable()) {
-        receiveThread_.join();
-    }
+    // Wait for thread to finish. On that thread itself (an onReceive
+    // listener that closes the socket) it cannot join itself: keep it for a
+    // later join from another thread. Then join what earlier calls kept.
+    keptThreads_.release(receiveThread_);
+    keptThreads_.joinOthers();
     receiving_ = false;
 
     localPort_ = 0;
@@ -329,6 +311,11 @@ void UdpSocket::startReceiving() {
         return;  // Already receiving
     }
 
+    // A receive thread that a listener's stopReceiving() or close() let go
+    // of has been told to stop: wait for it before clearing shouldStop_ for
+    // the new one. The calling thread itself, if kept, stays.
+    keptThreads_.joinOthers();
+
     shouldStop_ = false;
     receiving_ = true;
 
@@ -347,18 +334,13 @@ void UdpSocket::stopReceiving() {
     shouldStop_ = true;
     updateListener_.disconnect();
 
-    if (receiveThread_.joinable()) {
-        // Avoid joining self
-        if (receiveThread_.get_id() == std::this_thread::get_id()) {
-            receiveThread_.detach();
-        } else {
-            // Close socket to unblock recvfrom if blocking
-            // (Note: close() calls stopReceiving, so we might be here via close())
-            // If called directly, we might need to interrupt recvfrom.
-            // On Windows shutdown() helps, on POSIX closing socket helps.
-            receiveThread_.join();
-        }
-    }
+    // The thread waits in slices of 100 ms and sees shouldStop_ there. On
+    // that thread itself (an onReceive listener) it cannot join itself: keep
+    // it, and the next startReceiving(), stopReceiving() or close() on
+    // another thread, or the destructor, joins it. Then join what earlier
+    // calls kept.
+    keptThreads_.release(receiveThread_);
+    keptThreads_.joinOthers();
 
     receiving_ = false;
 }
@@ -425,6 +407,7 @@ void UdpSocket::receiveThreadFunc() {
     // Re-implementing with select/poll to allow proper stopping
     
     std::vector<char> buffer(RECEIVE_BUFFER_SIZE);
+    bool waitFailing = false;   // the previous wait failed too (report once per run)
 
     while (!shouldStop_.load()) {
         // Poll with timeout to allow checking shouldStop
@@ -446,6 +429,25 @@ void UdpSocket::receiveThreadFunc() {
 #endif
 
         if (shouldStop_.load()) break;
+
+        // A failed wait returns at once, so looping straight back into it
+        // would spin a core at 100% for as long as the failure lasts (Winsock
+        // torn down under the socket, for one), silently, while isReceiving()
+        // still says true. Report the first failure of a run and back off for
+        // one wait slice before trying again.
+        if (res < 0) {
+            int err = SOCKET_ERROR_CODE;
+#ifndef _WIN32
+            if (err == EINTR) continue;   // interrupted by a signal, not a failure
+#endif
+            if (!waitFailing) {
+                notifyError("Receive wait failed", err);
+                waitFailing = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        waitFailing = false;
 
         if (dataReady) {
             sockaddr_in fromAddr{};
@@ -535,6 +537,94 @@ bool UdpSocket::setReuseAddress(bool enable) {
     int val = enable ? 1 : 0;
     return setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR,
                       reinterpret_cast<const char*>(&val), sizeof(val)) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Multicast (IPv4)
+// ---------------------------------------------------------------------------
+namespace {
+// Fill an ip_mreq from a group address and an optional interface address.
+// Returns false if either address fails to parse.
+bool buildMreq(const std::string& groupAddr, const std::string& interfaceAddr, ip_mreq& mreq) {
+    mreq = ip_mreq{};
+    if (inet_pton(AF_INET, groupAddr.c_str(), &mreq.imr_multiaddr) != 1) {
+        return false;
+    }
+    if (interfaceAddr.empty()) {
+        mreq.imr_interface.s_addr = INADDR_ANY;  // default route
+    } else if (inet_pton(AF_INET, interfaceAddr.c_str(), &mreq.imr_interface) != 1) {
+        return false;
+    }
+    return true;
+}
+} // namespace
+
+bool UdpSocket::joinMulticastGroup(const std::string& groupAddr, const std::string& interfaceAddr) {
+    if (!ensureSocket()) return false;
+    ip_mreq mreq;
+    if (!buildMreq(groupAddr, interfaceAddr, mreq)) {
+        notifyError("Invalid multicast/interface address: " + groupAddr, 0);
+        return false;
+    }
+    if (setsockopt(socket_, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                   reinterpret_cast<const char*>(&mreq), sizeof(mreq)) != 0) {
+        notifyError("Failed to join multicast group " + groupAddr, SOCKET_ERROR_CODE);
+        return false;
+    }
+    return true;
+}
+
+bool UdpSocket::leaveMulticastGroup(const std::string& groupAddr, const std::string& interfaceAddr) {
+    if (socket_ == INVALID_SOCKET_HANDLE) return false;
+    ip_mreq mreq;
+    if (!buildMreq(groupAddr, interfaceAddr, mreq)) {
+        notifyError("Invalid multicast/interface address: " + groupAddr, 0);
+        return false;
+    }
+    return setsockopt(socket_, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                      reinterpret_cast<const char*>(&mreq), sizeof(mreq)) == 0;
+}
+
+bool UdpSocket::setMulticastTTL(int ttl) {
+    if (!ensureSocket()) return false;
+    // IP_MULTICAST_TTL expects an unsigned char payload on POSIX; Winsock takes
+    // an int. A single byte satisfies both (TTL is 0..255 anyway).
+    unsigned char val = static_cast<unsigned char>(ttl);
+    return setsockopt(socket_, IPPROTO_IP, IP_MULTICAST_TTL,
+                      reinterpret_cast<const char*>(&val), sizeof(val)) == 0;
+}
+
+bool UdpSocket::setMulticastLoopback(bool enable) {
+    if (!ensureSocket()) return false;
+    unsigned char val = enable ? 1 : 0;
+    return setsockopt(socket_, IPPROTO_IP, IP_MULTICAST_LOOP,
+                      reinterpret_cast<const char*>(&val), sizeof(val)) == 0;
+}
+
+bool UdpSocket::setMulticastInterface(const std::string& interfaceAddr) {
+    if (!ensureSocket()) return false;
+    struct in_addr ifaddr{};
+    if (interfaceAddr.empty()) {
+        ifaddr.s_addr = INADDR_ANY;
+    } else if (inet_pton(AF_INET, interfaceAddr.c_str(), &ifaddr) != 1) {
+        notifyError("Invalid multicast interface address: " + interfaceAddr, 0);
+        return false;
+    }
+    return setsockopt(socket_, IPPROTO_IP, IP_MULTICAST_IF,
+                      reinterpret_cast<const char*>(&ifaddr), sizeof(ifaddr)) == 0;
+}
+
+bool UdpSocket::setReusePort(bool enable) {
+    if (!ensureSocket()) return false;
+    int val = enable ? 1 : 0;
+#ifdef _WIN32
+    // Windows has no SO_REUSEPORT; SO_REUSEADDR already permits multiple binds.
+    return setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR,
+                      reinterpret_cast<const char*>(&val), sizeof(val)) == 0;
+#else
+    return setsockopt(socket_, SOL_SOCKET, SO_REUSEPORT,
+                      reinterpret_cast<const char*>(&val), sizeof(val)) == 0;
+#endif
 }
 
 bool UdpSocket::setReceiveBufferSize(int size) {

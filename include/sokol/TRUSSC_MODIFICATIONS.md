@@ -5,7 +5,14 @@ When updating from upstream, these changes need to be re-applied.
 
 Search for `tettou771` or `Modified by` or `[TrussC` to find all modified sections.
 
-**Upstream base:** https://github.com/floooh/sokol commit `672dea0` (2026-04-03)
+**Upstream base:** https://github.com/floooh/sokol commit `082152c` (2026-05-21)
+
+**Shader compiler:** sokol-tools-bin commit
+`11d0cf678105d614d675e6d9bd2aaf3eeff12f8c` (2026-08-29T14:15:01Z), the
+owner-selected master HEAD used by CI. The host hashes are recorded in
+`core/cmake/trussc_shaders.cmake`; update the commit and all five hashes together
+and check the generated shaders against these vendored headers. This compiler
+preserves the `metal_sim` and `wgsl` outputs required by TrussC.
 
 ---
 
@@ -13,23 +20,46 @@ Search for `tettou771` or `Modified by` or `[TrussC` to find all modified sectio
 
 ```
 sokol/
-├── sokol_app.h          # Modified (8 patches)
-├── sokol_gfx.h          # Untouched (direct copy from upstream)
+├── sokol_app_tc.h       # TrussC-owned fork: full sapp_* implementation on
+│                        #   every platform + multi-window API (sokol_app.h
+│                        #   no longer exists in this tree — see below)
+├── sokol_gfx.h          # Modified (2 patches: swapchain store-action hint +
+│                        #   uniform-buffer auto-grow, both Metal)
 ├── sokol_glue.h         # Modified (1 patch)
 ├── sokol_log.h          # Untouched
-├── sokol_audio.h        # Untouched
 ├── TRUSSC_MODIFICATIONS.md
 └── util/
     └── sokol_gl_tc.h    # Forked from upstream util/sokol_gl.h + TrussC modifications
 ```
 
+**Note:** `sokol_audio.h` is intentionally not included. TrussC's audio backend is
+miniaudio (see `tc/sound/tcAudio_impl.cpp` for the rationale).
+
 Matches upstream directory layout: core headers at root, utility headers in `util/`.
 
-**Note:** `sokol_imgui.h` has been moved to `addons/tcxImGui/src/sokol_imgui.h`. When updating sokol, update that copy as well (see How to Update Sokol below).
+**Note:** `sokol_imgui.h` has been moved to `addons/tcxImGui/src/sokol_imgui.h`. It carries TrussC patches (the `simgui_tc_*` multi-context API, marked `[TrussC]`) and one upstream cherry-pick, documented in [`addons/tcxImGui/src/imgui/TRUSSC_MODIFICATIONS.md`](../../../addons/tcxImGui/src/imgui/TRUSSC_MODIFICATIONS.md) together with the Dear ImGui patches. When updating sokol, update that copy as well (see How to Update Sokol below).
 
 ---
 
-## sokol_app.h
+## sokol_app_tc.h (replaces sokol_app.h)
+
+**sokol_app.h was deleted from this tree (2026-07, "sokol_app graduation").**
+`sokol_app_tc.h` is a self-contained TrussC-owned fork that implements the
+complete `sapp_*` public API (declarations absorbed verbatim, zlib license
+kept) plus the multi-window API on every platform: macOS (multi-window,
+NSWindow+CAMetalLayer+CADisplayLink), Windows (multi-window, HWND+D3D11+DXGI
+waitable), desktop Linux (multi-window, X11+GLX), GLES3 Linux / Raspberry Pi
+(single-window, X11+EGL), web (single-window, rAF + WebGPU/WebGL2), iOS
+(single-window, UIWindowScene+Metal) and Android (single-window,
+NativeActivity+EGL+Choreographer). Design + per-platform behavioral contracts:
+`docs/dev/sokol_app_tc-design.md` and `docs/dev/sapp-*-impl-spec.md`.
+
+It is NOT updated from upstream by 3-way merge — it is a permanent fork;
+upstream sokol_app changes are cherry-picked deliberately when wanted.
+
+The former sokol_app.h patches below are **native behavior** of
+sokol_app_tc.h now (kept here as historical record of what differs from
+upstream semantics):
 
 ### 1. Skip Present (D3D11 flickering fix)
 
@@ -96,6 +126,13 @@ Matches upstream directory layout: core headers at root, utility headers in `uti
 **Changes:**
 - In `_sapp_ios_mtl_update_framebuffer_dimensions()`: after setting drawable size, read back `layer.drawableSize` and update `framebuffer_width`/`framebuffer_height`
 
+### 8a. Android BACK Key No Shutdown
+
+**Purpose:** Suppress upstream BACK-key shutdown. Upstream `_sapp_android_key_event` reacts to `AKEYCODE_BACK` by calling `_sapp_android_shutdown()`, which destroys the EGL surface and invokes `cleanup_cb` immediately. Under screen pinning (lock-task mode), `ANativeActivity_finish()` is blocked by the OS, so the process keeps running but the EGL context is gone — the app appears frozen with the last frame on screen. We consume the event without shutting down. Long-term fix: implement `SAPP_EVENTTYPE_QUIT_REQUESTED` for Android (already supported on macOS/Windows/Linux — see line 158 support table).
+
+**Changes:**
+- In `_sapp_android_key_event()`: replaced `_sapp_android_shutdown()` with a comment explaining the issue; just `return true` to consume the event
+
 ### 8. Android DPI Scale
 
 **Purpose:** Use actual display density from `AConfiguration` instead of framebuffer/window ratio for `sapp_dpi_scale()`. Android baseline is 160dpi (mdpi), so `dpi_scale = density / 160`. This makes behavior consistent with macOS/Windows.
@@ -103,6 +140,62 @@ Matches upstream directory layout: core headers at root, utility headers in `uti
 **Changes:**
 - Added `#include <android/configuration.h>`
 - In Android `_sapp_android_update_dimensions()`: query `AConfiguration_getDensity()` and compute scale from actual density, falling back to fb/win ratio if unavailable
+
+### 14. CGBitmapInfo Enum Cast (Silence C++20 Warning)
+
+**Purpose:** Silence `-Wdeprecated-enum-enum-conversion` introduced by C++20 in the macOS dock-tile image setup. The original code OR-ed two CoreGraphics constants of different enum types (`CGImageAlphaInfo` and `CGImageByteOrderInfo`).
+
+**Changes:**
+- In `_sapp_macos_set_dock_tile()` CGImage creation: explicitly cast both operands to `CGBitmapInfo` (the destination type, a `uint32_t` typedef) before the bitwise OR. No behavioral change.
+
+---
+
+## sokol_gfx.h
+
+### Swapchain pass store-action hint (Metal)
+
+**Purpose:** Support TrussC's swapchain pass suspend/resume (Fbo / shadow /
+reflection passes mid-frame, issue #191). A resumed swapchain pass uses
+`SG_LOADACTION_LOAD`, but upstream hardcodes the Metal swapchain store actions
+to `MultisampleResolve` (MSAA color) and `DontCare` (depth), so the loaded
+content would be undefined.
+
+**Changes (both in `_sg_mtl_begin_pass`, swapchain branch, marked `[TrussC]`):**
+- MSAA color: when `action->depth.store_action == SG_STOREACTION_STORE` (the
+  "this pass may be suspended/resumed" hint set by
+  `trussc::ensureSwapchainPass()` / `resumeSwapchainPass()`), use
+  `MTLStoreActionStoreAndMultisampleResolve` instead of `MultisampleResolve`.
+- Depth: honor `action->depth.store_action` via `_sg_mtl_store_action()`
+  instead of hardcoded `DontCare` (default `DONTCARE` keeps upstream behavior).
+
+Passes without the hint (including every pass begun by plain sokol users and
+TrussC's final per-frame pass) behave exactly as upstream.
+
+### Per-frame uniform buffer auto-grow (Metal)
+
+**Purpose:** Upstream sizes the Metal per-frame uniform ring buffer once at
+`sg_setup()` (`sg_desc.uniform_buffer_size`, default 4MB ≈ 8k draw calls) and
+only `SOKOL_ASSERT`s on overflow — in release builds the assert compiles out
+and uniforms are silently corrupted (flipped/black frames). TrussC grows the
+ring on demand instead, so `WindowSettings::reserveUniformBuffer` becomes an
+optional optimization rather than a correctness requirement.
+
+**Changes (marked `[TrussC modification]`):**
+- New `_SG_LOGITEM_XMACRO(METAL_UNIFORM_BUFFER_GROWN, ...)`.
+- New `_sg_mtl_grow_uniform_buffer()` (before `_sg_mtl_apply_uniforms`): on
+  overflow, allocate a doubled `MTLBuffer` for the CURRENT rotate slot, retire
+  the old one through the normal deferred-release queue (draws already encoded
+  captured the old binding, and the buffer outlives in-flight command buffers),
+  reset `cur_ub_offset` to 0, rebind via `_sg_mtl_bind_uniform_buffers()`, and
+  log a warning with old/new sizes.
+- `_sg_mtl_apply_uniforms()`: overflow check + grow call before the memcpy.
+- `_sg_mtl_begin_pass()`: at first pass of a frame, if this rotate slot's
+  buffer is smaller than `ub_size` (grown while the slot was in flight),
+  replace it — safe because the inflight-frame semaphore was just acquired.
+- `#include <stdio.h>` next to `<string.h>` (snprintf for the log message).
+
+WebGPU/Vulkan backends are untouched (their uniform buffers are baked into
+bind groups / descriptor sets; growing them is much more invasive).
 
 ---
 
@@ -128,6 +221,15 @@ TrussC-specific public functions use the `sgl_tc_` prefix to distinguish from up
 - `_sgl_draw()`: uses `sg_append_buffer` instead of `sg_update_buffer`
 - Vertex buffer offsets tracked per draw call via `base_vertex`
 - GPU buffer recreated on overflow if released
+- **Single upload per frame (shared across layer draws):** `_sgl_draw()` appends
+  the full vertex set to the GPU buffer only on the FIRST call of a frame and
+  reuses the returned base offset for the remaining layer draws (cache keyed on
+  `frame_id` / vertex count / `vbuf.id`, fields `upload_*`; invalidated by
+  `sgl_tc_context_reset`). Without this, flushing N layers (e.g. one per deferred
+  PBR/shader draw, see `flushDeferredShaderDraws`) re-appended V vertices N times,
+  so `append_pos` reached N×V and `_sgl_grow_gpu_buffer` doubled the GPU buffer
+  until allocation failed (Metal `id:52` / `METAL_CREATE_BUFFER_FAILED`), killing
+  all sgl rendering. Regression test: `core/tests/sglLayerUpload` (dummy backend).
 
 ### 11. Auto-grow Buffers
 
@@ -151,6 +253,7 @@ These functions do NOT exist in upstream sokol_gl. They are TrussC additions.
 | `sgl_tc_context_reset(ctx)` | Reset command/vertex/uniform counters to zero (fast path between FBO draws on shared context) |
 | `sgl_tc_context_release_buffers(ctx)` | Release CPU + GPU buffers to free idle memory (context shell and pipelines preserved) |
 | `sgl_tc_context_ensure_buffers(ctx)` | Ensure buffers are allocated (no-op if already allocated, call before drawing after release) |
+| `sgl_tc_reset_matrix_stacks()` | Drop every matrix stack of the current context back to depth 0 — called at frame end (`present()`, TrussC #232) and at FBO pass begin (`Fbo::beginInternal()`, TrussC #327) so an unpopped `pushMatrix()` can't carry sgl's stack depth into the next frame or FBO pass |
 
 ### 13. Float Vertex Colors (UBYTE4N -> FLOAT4)
 
@@ -164,12 +267,40 @@ These functions do NOT exist in upstream sokol_gl. They are TrussC additions.
 - All `sgl_c*f/c*b/c1i` functions store floats directly
 - Vertex size increased from 28 to 40 bytes (~1.4x)
 
+### 14. Pool handling (#317)
+
+**Purpose:** pool limits show up as id 0 that callers already handle, and the
+context pool grows like the buffers in 11.
+
+**Changes:**
+- `_sgl_make_pipeline()`: all or nothing. `_sgl_init_pipeline()` stops at the
+  first `sg_make_pipeline()` that returns an invalid id or a pipeline that is
+  not `SG_RESOURCESTATE_VALID`; `_sgl_make_pipeline()` then destroys the sg
+  pipelines already made, frees the sgl slot and returns `SG_INVALID_ID`.
+- `_sgl_draw()`: skips a draw command whose sg pipeline id is 0 (recorded
+  while an invalid or destroyed sgl pipeline was loaded) instead of passing
+  it to `sg_apply_pipeline()`.
+- `_sgl_grow_context_pool()`: when `_sgl_alloc_context()` finds no free slot,
+  the context array and the pool bookkeeping double (up to
+  `_SGL_MAX_POOL_SIZE - 1`), `_sgl.cur_ctx` is looked up again, and a warning
+  with the old and new size is logged (`SGL_LOGITEM_CONTEXT_POOL_GROWN`,
+  message built with `snprintf` through `_sgl_log_msg()`; `<stdio.h>` added).
+  Contexts are referenced by id, so moving them is safe.
+  Growth allocations are fallible: on allocation failure, temporary arrays
+  are freed, the old pool and current context stay intact, and context
+  creation returns id 0 so TrussC can warn once without retrying.
+- `_SGL_DEFAULT_CONTEXT_POOL_SIZE`: 4 -> 8 (start size; reason next to it).
+
+Regression test: `core/tests/sglPoolLimits` (dummy backend).
+
 ---
 
 ## sokol_gfx.h
 
 **Untouched.** Pool sizes are configured at runtime in TrussC's `tcGlobal.cpp`:
-- `pipeline_pool_size = 256` (default 64)
+- `shader_pool_size = 1024` (default 32) and `pipeline_pool_size = 1024`
+  (default 64): fixed sizes, since these pools cannot grow (reasons next to
+  the constants)
 - `image_pool_size = 10000`
 - `view_pool_size = 10000`
 - `sampler_pool_size = 10000`
@@ -178,15 +309,48 @@ These functions do NOT exist in upstream sokol_gl. They are TrussC additions.
 
 ## How to Update Sokol
 
-1. Download new headers from https://github.com/floooh/sokol
-2. **sokol_gfx.h** -- overwrite directly (no modifications)
-3. **sokol_app.h** -- overwrite, then re-apply patches #1--#8 (search `tettou771` or `[TrussC`)
-4. **sokol_glue.h** -- overwrite, then re-apply patch #9
-5. **util/sokol_gl_tc.h** -- copy upstream `util/sokol_gl.h`, rename, then re-apply patches #10--#13 (search `[TrussC`)
-6. **addons/tcxImGui/src/sokol_imgui.h** -- overwrite directly from upstream `util/sokol_imgui.h` (moved from trussc core to tcxImGui addon)
-7. **Other headers** (sokol_log.h, etc.) -- overwrite directly
-8. Update the **Upstream base** commit hash at the top of this file
-9. Test on all platforms (macOS, Windows D3D11, Emscripten Web)
+For files with TrussC patches (sokol_glue.h, util/sokol_gl_tc.h, and
+addons/tcxImGui/src/sokol_imgui.h), **use `git merge-file` as a 3-way merge** instead of overwriting and manually
+re-applying patches. This avoids slip bugs from manual patch transcription.
+
+`sokol_app_tc.h` is NOT part of this process — it is a permanent fork, not a
+patched upstream copy. Pull upstream sokol_app improvements into it by
+deliberate cherry-pick (the per-platform impl specs in docs/dev/ map upstream
+line ranges to the tc sections).
+
+### Recommended: 3-way merge for patched files
+
+```bash
+# Stage three versions in /tmp:
+#   BASE   — upstream sokol at the commit recorded above (pre-patch)
+#   OURS   — current TrussC copy with all patches
+#   THEIRS — new upstream master we want to update to
+(cd <sokol-clone>; git show <base-sha>:sokol_glue.h) > /tmp/BASE.h
+cp <sokol-clone>/sokol_glue.h /tmp/THEIRS.h
+cp core/include/sokol/sokol_glue.h /tmp/OURS.h
+
+# Run merge; conflicts (if any) end up as <<<<<<< / ======= / >>>>>>> blocks
+# (git 2.43 rejects --diff-algorithm; drop it there — plain merge-file works)
+git merge-file --diff-algorithm=histogram -p /tmp/OURS.h /tmp/BASE.h /tmp/THEIRS.h > /tmp/MERGED.h
+
+# Resolve conflicts in /tmp/MERGED.h, then copy back
+cp /tmp/MERGED.h core/include/sokol/sokol_glue.h
+```
+
+Repeat for `util/sokol_gl_tc.h` (use upstream `util/sokol_gl.h` as BASE and
+THEIRS, since sokol_gl_tc.h is the renamed fork), and for
+`addons/tcxImGui/src/sokol_imgui.h` (upstream `util/sokol_imgui.h`).
+
+### Direct overwrite (for files without TrussC patches)
+
+1. **sokol_gfx.h** -- overwrite directly (no modifications)
+2. **Other headers** (sokol_log.h, etc.) -- overwrite directly
+
+### After updating
+
+4. Update the **Upstream base** commit hash at the top of this file
+5. Verify by searching for patch markers: `grep -rn "tettou771\|\[TrussC" core/include/sokol/` — the count should match what's documented per file
+6. Test on all platforms (macOS, Windows D3D11, Emscripten Web, Linux, iOS, Android)
 
 ## Removed Patches
 

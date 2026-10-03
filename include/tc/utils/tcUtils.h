@@ -1,4 +1,5 @@
 #pragma once
+#include "tc/utils/tcAnnotations.h"
 
 #include <string>
 #include <sstream>
@@ -8,13 +9,17 @@
 #include <cstdint>
 #include <unordered_map>
 #include <cmath>
+#include <chrono>
 #include <memory>
 #include <filesystem>
+#include <atomic>
+#include <mutex>
+#include "tc/utils/tcFileIO.h"   // fs alias + path boundary helpers
 #include "../sound/tcSound.h"
 
 // Forward declaration for tcPlatform.h (avoid circular include)
 namespace trussc {
-    std::string getExecutableDir();
+    fs::path getExecutableDir();
 }
 
 namespace trussc {
@@ -29,57 +34,119 @@ namespace internal {
 // ---------------------------------------------------------------------------
 
 namespace internal {
-    // Default is "data/" relative to executable directory
-    // On macOS, executable is in xxx.app/Contents/MacOS/, so "../../../data/" points to bin/data/
-    #ifdef __APPLE__
-    inline std::string dataPathRoot = "../../../data/";
-    #else
-    inline std::string dataPathRoot = "data/";
-    #endif
-    inline bool dataPathRootIsAbsolute = false;
+    // The data path root, one per process. Defined in tcGlobal.cpp, not
+    // inline here: app code sets it (setDataPathRoot) and host code resolves
+    // paths with it (e.g. tc_start_recording), so both must reach one copy,
+    // also from a Windows hot reload guest DLL.
+    //
+    // Its compile-time default is "data", or "../../../data" on Apple. On Apple
+    // the true root differs by bundle layout and is chosen at runtime (see
+    // resolveDataPathRootOnce): macOS keeps data in bin/data/ reached via
+    // ../../../ from Contents/MacOS/, while iOS uses a FLAT bundle with data/
+    // right next to the executable. Existence, not a preprocessor macro, is the
+    // source of truth (TARGET_OS_* proved unreliable in the iOS build, and the
+    // runtime probe also runs too early in _setup_cb to see a valid executable
+    // path — so it happens right before the App's setup(), or on the first
+    // getDataPath() call if that comes earlier, from any thread).
+    struct DataPathState {
+        fs::path root;
+        bool userSet = false;            // user called setDataPathRoot()
+        std::atomic<bool> probed{false}; // root final (Apple probe done or skipped)
+        std::mutex probeMutex;           // guards the probe and setDataPathRoot()
+    };
+    DataPathState& dataPathState();
 }
 
 // Set the data path root
-// If relative path, resolved relative to executable directory
-// If absolute path (starts with /), used as-is
-inline void setDataPathRoot(const std::string& path) {
-    internal::dataPathRoot = path;
-    // Add trailing slash if missing
-    if (!internal::dataPathRoot.empty() && internal::dataPathRoot.back() != '/') {
-        internal::dataPathRoot += '/';
-    }
-    // Record whether path is absolute
-    internal::dataPathRootIsAbsolute = (!path.empty() && path[0] == '/');
+// If relative, resolved relative to executable directory
+// If absolute, used as-is (fs::path::is_absolute — handles "C:/..." on Windows too)
+// Call it before starting threads that load files (e.g. in setup()): loaders
+// read the root without a lock.
+inline void setDataPathRoot(const fs::path& path) {
+    auto& state = internal::dataPathState();
+    std::lock_guard<std::mutex> lock(state.probeMutex);
+    state.root = path;
+    state.userSet = true;  // explicit choice wins over the probe
 }
 
+namespace internal {
+// One-shot: pick the Apple bundle layout by probing which data/ exists next to
+// the executable. Skipped if the user set the root explicitly. Elsewhere it
+// only sets the flag.
+// Safe to call from any thread: the probe runs once, under probeMutex; later
+// calls only read the atomic flag.
+inline void resolveDataPathRootOnce() {
+    auto& state = dataPathState();
+    if (state.probed.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(state.probeMutex);
+    if (state.probed.load(std::memory_order_relaxed)) return;
+#ifndef __APPLE__
+    state.probed.store(true, std::memory_order_release);  // nothing to probe
+#else
+    if (state.userSet) {
+        state.probed.store(true, std::memory_order_release);
+        return;
+    }
+    fs::path exe = getExecutableDir();
+    // Don't latch until the executable path is actually available — early on
+    // iOS it can be empty/"/", which would resolve the checks against the CWD.
+    // The next call retries.
+    if (exe.empty() || exe == fs::path("/")) return;
+    std::error_code ec;
+    // Check the flat-bundle layout FIRST (unambiguous on iOS: data/ sits right
+    // next to the executable). macOS dev has no Contents/MacOS/data, so it
+    // correctly falls through to the ../../../data (bin/data) layout.
+    if (std::filesystem::exists(exe / "data", ec)) {
+        state.root = "data";            // iOS flat bundle / distributed
+    } else if (std::filesystem::exists(exe / "../../../data", ec)) {
+        state.root = "../../../data";   // macOS dev / bin layout
+    }
+    // else: keep the compile-time default
+    state.probed.store(true, std::memory_order_release);
+#endif
+}
+
+// The root after resolveDataPathRootOnce(). Until the probe has latched (the
+// executable path was not available yet) it is read under probeMutex, since
+// another thread may be probing.
+inline fs::path currentDataPathRoot() {
+    resolveDataPathRootOnce();
+    auto& state = dataPathState();
+    if (state.probed.load(std::memory_order_acquire)) return state.root;
+    std::lock_guard<std::mutex> lock(state.probeMutex);
+    return state.root;
+}
+} // namespace internal
+
 // Get the data path root
-inline std::string getDataPathRoot() {
-    return internal::dataPathRoot;
+inline fs::path getDataPathRoot() {
+    return internal::currentDataPathRoot();
 }
 
 // Get data path for a filename
-// - If filename is absolute, return as-is
+// - If filename is absolute, return as-is (like oF)
 // - Otherwise, resolved relative to executable directory + dataPathRoot
-inline std::string getDataPath(const std::string& filename) {
-    // If filename is absolute, return as-is (like oF)
-    // Uses std::filesystem for cross-platform support (Unix: /path, Windows: C:\path)
-    if (!filename.empty() && std::filesystem::path(filename).is_absolute()) {
+// - Normalize only that base; preserve filename components (including symlink/..).
+// Safe to call from any thread (e.g. Pixels::load on a worker).
+inline fs::path getDataPath(const fs::path& filename) {
+    if (!filename.empty() && filename.is_absolute()) {
         return filename;
     }
 
-    if (internal::dataPathRootIsAbsolute) {
-        // Absolute dataPathRoot: use as-is
-        return internal::dataPathRoot + filename;
+    const fs::path root = internal::currentDataPathRoot();
+    if (root.is_absolute()) {
+        return root.lexically_normal() / filename;
     } else {
-        // Relative path: resolve relative to executable directory
-        return getExecutableDir() + internal::dataPathRoot + filename;
+        // Relative root: resolve relative to executable directory
+        return (getExecutableDir() / root).lexically_normal() / filename;
     }
 }
 
 // For macOS bundle distribution: Set data path to Resources folder
 // Will reference xxx.app/Contents/Resources/data/
 // No-op on non-macOS platforms
-inline void setDataPathToResources() {
+// Like setDataPathRoot(), call it before starting threads that load files.
+TC_PLATFORMS("macos,ios") inline void setDataPathToResources() {
     #ifdef __APPLE__
     setDataPathRoot("../Resources/data/");
     #endif
@@ -328,6 +395,31 @@ inline std::string toBase64(const std::string& bytes) {
     return toBase64(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size());
 }
 
+inline std::vector<unsigned char> fromBase64(const std::string& encoded) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;   // '=' padding, whitespace, and anything else: skipped
+    };
+    std::vector<unsigned char> out;
+    out.reserve(encoded.size() * 3 / 4);
+    int buf = 0, bits = 0;
+    for (char c : encoded) {
+        int v = val(c);
+        if (v < 0) continue;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((unsigned char)((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // String Operations
 // ---------------------------------------------------------------------------
@@ -504,7 +596,7 @@ enum class Beep {
     sweep       // Screen transition whoosh
 };
 
-namespace beep_internal {
+namespace internal {
 
 // Cache key for preset sounds (negative to avoid collision with frequencies)
 inline int presetToKey(Beep type) {
@@ -514,9 +606,29 @@ inline int presetToKey(Beep type) {
 // Internal state manager
 struct BeepManager {
     std::unordered_map<int, std::shared_ptr<Sound>> cache;
-    uint64_t lastBeepFrame = 0;
+    // Time-based debounce (multi-window safe): keyed on a monotonic clock rather
+    // than the main-window frame counter, so the "collapse a burst of beep()
+    // calls in one frame into a single beep" guard works identically no matter
+    // which window (or a worker thread) triggers it. A local steady_clock read
+    // avoids depending on getElapsedTime(), which isn't declared in this header.
+    std::chrono::steady_clock::time_point lastBeepTime{};
+    bool lastBeepTimeValid = false;
+    static constexpr double beepDebounceSeconds = 0.005;  // suppress within ~5 ms
     float volume = 0.5f;
     static constexpr size_t MAX_CACHE_SIZE = 128;
+
+    // Returns true if a beep issued now should be suppressed (a previous beep
+    // fired < beepDebounceSeconds ago). Updates the timestamp on a pass.
+    bool debounce() {
+        auto now = std::chrono::steady_clock::now();
+        if (lastBeepTimeValid) {
+            double dt = std::chrono::duration<double>(now - lastBeepTime).count();
+            if (dt < beepDebounceSeconds) return true;
+        }
+        lastBeepTime = now;
+        lastBeepTimeValid = true;
+        return false;
+    }
 
     // Generate sound for a preset type
     std::shared_ptr<Sound> generatePreset(Beep type) {
@@ -670,9 +782,7 @@ struct BeepManager {
     }
 
     void playPreset(Beep type) {
-        uint64_t currentFrame = internal::updateFrameCount;
-        if (currentFrame == lastBeepFrame && currentFrame > 0) return;
-        lastBeepFrame = currentFrame;
+        if (debounce()) return;
 
         int key = presetToKey(type);
         auto it = cache.find(key);
@@ -687,9 +797,7 @@ struct BeepManager {
     }
 
     void playFrequency(float freq) {
-        uint64_t currentFrame = internal::updateFrameCount;
-        if (currentFrame == lastBeepFrame && currentFrame > 0) return;
-        lastBeepFrame = currentFrame;
+        if (debounce()) return;
 
         int key = static_cast<int>(freq);
         auto it = cache.find(key);
@@ -709,41 +817,40 @@ struct BeepManager {
     }
 };
 
-inline BeepManager& getManager() {
-    static BeepManager manager;
-    return manager;
-}
+// Defined in tcGlobal.cpp: one beep cache / volume / debounce per process, so a
+// hot reload guest's setBeepVolume() survives reloads on Windows too (#249).
+BeepManager& getManager();
 
-} // namespace beep_internal
+} // namespace internal
 
 // Play default beep (ping)
 inline void beep() {
-    beep_internal::getManager().playPreset(Beep::ping);
+    internal::getManager().playPreset(Beep::ping);
 }
 
 // Play preset sound
 inline void beep(Beep type) {
-    beep_internal::getManager().playPreset(type);
+    internal::getManager().playPreset(type);
 }
 
 // Play custom frequency
 inline void beep(float frequency) {
-    beep_internal::getManager().playFrequency(frequency);
+    internal::getManager().playFrequency(frequency);
 }
 
 // Play custom frequency (int overload)
 inline void beep(int frequency) {
-    beep_internal::getManager().playFrequency(static_cast<float>(frequency));
+    internal::getManager().playFrequency(static_cast<float>(frequency));
 }
 
 // Set beep volume (0.0-1.0)
 inline void setBeepVolume(float vol) {
-    beep_internal::getManager().setVolume(vol);
+    internal::getManager().setVolume(vol);
 }
 
 // Get current beep volume
 inline float getBeepVolume() {
-    return beep_internal::getManager().volume;
+    return internal::getManager().volume;
 }
 
 } // namespace trussc

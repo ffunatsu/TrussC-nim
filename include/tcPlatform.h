@@ -1,4 +1,5 @@
 #pragma once
+#include "tc/utils/tcAnnotations.h"
 
 #include <string>
 #include <filesystem>
@@ -116,22 +117,29 @@ float getDisplayScaleFactor();
 // Get window position in screen coordinates (logical pixels, top-left origin)
 // macOS/Windows: returns top-left corner of the window frame
 // Linux/Mobile/Web: stub, returns (-1, -1)
-IVec2 getWindowPosition();
+TC_PLATFORMS("macos,windows") IVec2 getWindowPosition();
 
 // Set window position in screen coordinates (logical pixels, top-left origin)
 // macOS/Windows: moves the window
 // Linux/Mobile/Web: no-op (stub)
-void setWindowPosition(int x, int y);
+TC_PLATFORMS("macos,windows") void setWindowPosition(int x, int y);
+
+// Set whether the window shows standard decorations (title bar, borders,
+// buttons). false = borderless/chromeless, but the window stays key-focusable
+// (keyboard works) and closable (exitApp() works). Usually driven once at
+// startup by WindowSettings::setDecorated(), but can be toggled at runtime.
+// Desktop only; no-op on mobile/web.
+void setWindowDecorated(bool decorated);
 
 // Change window size (specified in logical size)
 // macOS: Uses NSWindow
 void setWindowSizeLogical(int width, int height);
 
 // Get absolute path of executable
-std::string getExecutablePath();
+fs::path getExecutablePath();
 
 // Get directory containing executable (with trailing /)
-std::string getExecutableDir();
+fs::path getExecutableDir();
 
 // ---------------------------------------------------------------------------
 // Immersive mode (hide system UI)
@@ -139,8 +147,8 @@ std::string getExecutableDir();
 // iOS: hides status bar + home indicator (auto-hidden)
 // Desktop: no-op
 // ---------------------------------------------------------------------------
-void setImmersiveMode(bool enabled);
-bool getImmersiveMode();
+TC_PLATFORMS("android,ios") void setImmersiveMode(bool enabled);
+TC_PLATFORMS("android,ios") bool getImmersiveMode();
 
 // ---------------------------------------------------------------------------
 // Keep screen on (prevent display sleep / auto-lock)
@@ -150,8 +158,8 @@ bool getImmersiveMode();
 // Windows: SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_CONTINUOUS)
 // Linux / Web: no-op
 // ---------------------------------------------------------------------------
-void setKeepScreenOn(bool enabled);
-bool getKeepScreenOn();
+TC_PLATFORMS("macos,windows,android,ios") void setKeepScreenOn(bool enabled);
+TC_PLATFORMS("macos,windows,android,ios") bool getKeepScreenOn();
 
 // ---------------------------------------------------------------------------
 // Screenshot functionality
@@ -159,14 +167,25 @@ bool getKeepScreenOn();
 
 // Capture current window and store in Pixels
 // Returns true on success, false on failure
-bool captureWindow(Pixels& outPixels);
+// Web: not implemented (no canvas readback); always returns false and warns
+// once.
+TC_PLATFORMS("macos,windows,linux,ios,android") bool captureWindow(Pixels& outPixels);
 
-// Capture current window and save to file
-// Returns true on success, false on failure
-// Save screenshot (uses OS window capture feature)
-// Relative paths are resolved relative to executable directory + data path
-// Supported formats: .png, .jpg/.jpeg, .tiff/.tif, .bmp
-bool saveScreenshot(const std::filesystem::path& path);
+// Internal: synchronous capture + file write (the actual worker behind the
+// public deferred saveScreenshot()). Must run at a safe readback point, i.e.
+// AFTER present() (see the afterFrame drain in TrussC.h). Callers pass an
+// already-resolved absolute path; the parent directory is assumed to exist.
+// Returns true on success, false on failure.
+// Formats: png/jpg/jpeg/bmp; macOS also tiff/tif/gif, Windows also tga.
+// Unsupported or missing extensions append .png and warn.
+// Web: a stub that always returns false and warns once; saveScreenshot()
+// calls it directly instead of queuing.
+namespace internal {
+// Resolve the data path and the platform-specific screenshot extension.
+// Returns the actual destination, warning when .png is appended.
+std::filesystem::path resolveScreenshotPath(const std::filesystem::path& path);
+bool captureWindowToFile(const std::filesystem::path& path);
+}
 
 // ---------------------------------------------------------------------------
 // System volume (0.0 - 1.0)
@@ -183,39 +202,39 @@ void setSystemVolume(float volume);  // iOS: logs warning (not supported by OS)
 //            (e.g. slider at max → value ~0.64). This is normal Android behavior.
 //   Desktop: returns -1 (not supported)
 // ---------------------------------------------------------------------------
-float getSystemBrightness();
-void setSystemBrightness(float brightness);
+TC_PLATFORMS("macos,android,ios") float getSystemBrightness();
+TC_PLATFORMS("macos,android,ios") void setSystemBrightness(float brightness);
 
 // ---------------------------------------------------------------------------
 // Thermal monitoring
 // ---------------------------------------------------------------------------
-ThermalState getThermalState();
-float getThermalTemperature();  // Celsius, -1 if unavailable
+TC_PLATFORMS("macos,ios,android") ThermalState getThermalState();
+TC_PLATFORMS("") float getThermalTemperature();  // stub on all platforms — always returns -1 (no OS exposes raw CPU temperature)
 
 // ---------------------------------------------------------------------------
 // Battery
 // ---------------------------------------------------------------------------
-float getBatteryLevel();      // 0.0-1.0, -1 if unavailable (e.g. desktop without battery)
-bool isBatteryCharging();
+TC_PLATFORMS("macos,android,ios") float getBatteryLevel();      // 0.0-1.0, -1 if unavailable (e.g. desktop without battery)
+TC_PLATFORMS("macos,android,ios") bool isBatteryCharging();
 
 // ---------------------------------------------------------------------------
 // Motion sensors (iOS/Android; desktop returns zero)
 // ---------------------------------------------------------------------------
-Vec3 getAccelerometer();       // g-force (1.0 = Earth gravity)
-Vec3 getGyroscope();           // angular velocity (rad/s)
-Quaternion getDeviceOrientation();  // fused attitude (accel+gyro+mag)
-float getCompassHeading();     // radians (0 = north, clockwise)
+TC_PLATFORMS("android,ios") Vec3 getAccelerometer();       // g-force (1.0 = Earth gravity)
+TC_PLATFORMS("android,ios") Vec3 getGyroscope();           // angular velocity (rad/s)
+TC_PLATFORMS("android,ios") Quaternion getDeviceOrientation();  // fused attitude (accel+gyro+mag)
+TC_PLATFORMS("android,ios") float getCompassHeading();     // radians (0 = north, clockwise)
 
 // ---------------------------------------------------------------------------
 // Proximity sensor
 // ---------------------------------------------------------------------------
-bool isProximityClose();
+TC_PLATFORMS("android,ios") bool isProximityClose();
 
 // ---------------------------------------------------------------------------
 // Location (GPS / WiFi)
 // Starts location updates on first call. Returns most recent fix.
 // ---------------------------------------------------------------------------
-Location getLocation();
+TC_PLATFORMS("macos,android,ios") Location getLocation();
 
 // ---------------------------------------------------------------------------
 // Internal — called by the framework, not user code

@@ -3,7 +3,9 @@
 // This file is included from TrussC.h
 // Note: tcTexture.h and tcImage.h must be included before this file
 
+#include <cstdint>
 #include <vector>
+#include "tcPath.h"   // for the out-of-line Path::toFillMesh() definition below
 
 namespace trussc {
 
@@ -48,7 +50,7 @@ public:
         indices_ = other.indices_;
         texCoords_ = other.texCoords_;
         tangents_ = other.tangents_;
-        gpuDirty_ = true;
+        markChanged();
         return *this;
     }
 
@@ -64,12 +66,18 @@ public:
           ibuf_(other.ibuf_),
           gpuVertexCount_(other.gpuVertexCount_),
           gpuIndexCount_(other.gpuIndexCount_),
-          gpuDirty_(other.gpuDirty_) {
+          dataRevision_(other.dataRevision_),
+          gpuRevision_(other.gpuRevision_),
+          pbuf_(other.pbuf_),
+          gpuPointCount_(other.gpuPointCount_),
+          pointGpuRevision_(other.pointGpuRevision_) {
         other.vbuf_ = {};
         other.ibuf_ = {};
         other.gpuVertexCount_ = 0;
         other.gpuIndexCount_ = 0;
-        other.gpuDirty_ = true;
+        other.pbuf_ = {};
+        other.gpuPointCount_ = 0;
+        other.markChanged();
     }
 
     Mesh& operator=(Mesh&& other) noexcept {
@@ -86,18 +94,30 @@ public:
         ibuf_ = other.ibuf_;
         gpuVertexCount_ = other.gpuVertexCount_;
         gpuIndexCount_ = other.gpuIndexCount_;
-        gpuDirty_ = other.gpuDirty_;
+        // Assignment changes this mesh even when both objects have the same
+        // revision. Preserve the transferred buffers' clean/stale state.
+        const bool gpuClean = other.gpuRevision_ == other.dataRevision_;
+        const bool pointsClean = other.pointGpuRevision_ == other.dataRevision_;
+        markChanged();
+        gpuRevision_ = gpuClean ? dataRevision_ : dataRevision_ - 1;
+        pbuf_ = other.pbuf_;
+        gpuPointCount_ = other.gpuPointCount_;
+        pointGpuRevision_ = pointsClean ? dataRevision_ : dataRevision_ - 1;
         other.vbuf_ = {};
         other.ibuf_ = {};
         other.gpuVertexCount_ = 0;
         other.gpuIndexCount_ = 0;
-        other.gpuDirty_ = true;
+        other.pbuf_ = {};
+        other.gpuPointCount_ = 0;
+        other.markChanged();
         return *this;
     }
 
     // Mode settings
-    void setMode(PrimitiveMode mode) {
+    Mesh& setMode(PrimitiveMode mode) {
         mode_ = mode;
+        markChanged();
+        return *this;
     }
 
     PrimitiveMode getMode() const {
@@ -107,46 +127,66 @@ public:
     // ---------------------------------------------------------------------------
     // Vertices
     // ---------------------------------------------------------------------------
-    void addVertex(float x, float y, float z = 0.0f) {
+    Mesh& addVertex(float x, float y, float z = 0.0f) {
         vertices_.push_back(Vec3{x, y, z});
+        markChanged();
+        return *this;
     }
 
-    void addVertex(const Vec2& v) {
+    Mesh& addVertex(const Vec2& v) {
         vertices_.push_back(Vec3{v.x, v.y, 0.0f});
+        markChanged();
+        return *this;
     }
 
-    void addVertex(const Vec3& v) {
+    Mesh& addVertex(const Vec3& v) {
         vertices_.push_back(v);
+        markChanged();
+        return *this;
     }
 
-    void addVertices(const std::vector<Vec3>& verts) {
+    Mesh& addVertices(const std::vector<Vec3>& verts) {
         for (const auto& v : verts) {
             vertices_.push_back(v);
         }
+        markChanged();
+        return *this;
     }
 
-    std::vector<Vec3>& getVertices() { return vertices_; }
+    // Non-const access marks the mesh changed (writes through the reference
+    // are uploaded on the next GPU draw). To only read, use a const Mesh&
+    // (or std::as_const(mesh).getVertices()).
+    std::vector<Vec3>& getVertices() { markChanged(); return vertices_; }
     const std::vector<Vec3>& getVertices() const { return vertices_; }
     int getNumVertices() const { return static_cast<int>(vertices_.size()); }
 
     // ---------------------------------------------------------------------------
     // Colors (vertex colors)
     // ---------------------------------------------------------------------------
-    void addColor(const Color& c) {
+    Mesh& addColor(const Color& c) {
         colors_.push_back(c);
+        markChanged();
+        return *this;
     }
 
-    void addColor(float r, float g, float b, float a = 1.0f) {
+    Mesh& addColor(float r, float g, float b, float a = 1.0f) {
         colors_.push_back(Color{r, g, b, a});
+        markChanged();
+        return *this;
     }
 
-    void addColors(const std::vector<Color>& cols) {
+    Mesh& addColors(const std::vector<Color>& cols) {
         for (const auto& c : cols) {
             colors_.push_back(c);
         }
+        markChanged();
+        return *this;
     }
 
-    std::vector<Color>& getColors() { return colors_; }
+    // Non-const access marks the mesh changed (writes through the reference
+    // are uploaded on the next GPU draw). To only read, use a const Mesh&
+    // (or std::as_const(mesh).getColors()).
+    std::vector<Color>& getColors() { markChanged(); return colors_; }
     const std::vector<Color>& getColors() const { return colors_; }
     int getNumColors() const { return static_cast<int>(colors_.size()); }
     bool hasColors() const { return !colors_.empty(); }
@@ -154,24 +194,33 @@ public:
     // ---------------------------------------------------------------------------
     // Indices
     // ---------------------------------------------------------------------------
-    void addIndex(unsigned int index) {
+    Mesh& addIndex(unsigned int index) {
         indices_.push_back(index);
+        markChanged();
+        return *this;
     }
 
-    void addIndices(const std::vector<unsigned int>& inds) {
+    Mesh& addIndices(const std::vector<unsigned int>& inds) {
         for (auto i : inds) {
             indices_.push_back(i);
         }
+        markChanged();
+        return *this;
     }
 
     // Add triangle (3 indices)
-    void addTriangle(unsigned int i0, unsigned int i1, unsigned int i2) {
+    Mesh& addTriangle(unsigned int i0, unsigned int i1, unsigned int i2) {
         indices_.push_back(i0);
         indices_.push_back(i1);
         indices_.push_back(i2);
+        markChanged();
+        return *this;
     }
 
-    std::vector<unsigned int>& getIndices() { return indices_; }
+    // Non-const access marks the mesh changed (writes through the reference
+    // are uploaded on the next GPU draw). To only read, use a const Mesh&
+    // (or std::as_const(mesh).getIndices()).
+    std::vector<unsigned int>& getIndices() { markChanged(); return indices_; }
     const std::vector<unsigned int>& getIndices() const { return indices_; }
     int getNumIndices() const { return static_cast<int>(indices_.size()); }
     bool hasIndices() const { return !indices_.empty(); }
@@ -179,24 +228,32 @@ public:
     // ---------------------------------------------------------------------------
     // Normals (for lighting)
     // ---------------------------------------------------------------------------
-    void addNormal(float nx, float ny, float nz) {
+    Mesh& addNormal(float nx, float ny, float nz) {
         normals_.push_back(Vec3{nx, ny, nz});
+        markChanged();
+        return *this;
     }
 
-    void addNormal(const Vec3& n) {
+    Mesh& addNormal(const Vec3& n) {
         normals_.push_back(n);
+        markChanged();
+        return *this;
     }
 
-    void addNormals(const std::vector<Vec3>& norms) {
+    Mesh& addNormals(const std::vector<Vec3>& norms) {
         for (const auto& n : norms) {
             normals_.push_back(n);
         }
+        markChanged();
+        return *this;
     }
 
-    void setNormal(size_t index, const Vec3& n) {
+    Mesh& setNormal(size_t index, const Vec3& n) {
         if (index < normals_.size()) {
             normals_[index] = n;
         }
+        markChanged();
+        return *this;
     }
 
     Vec3 getNormal(size_t index) const {
@@ -206,7 +263,10 @@ public:
         return Vec3{0, 0, 1};  // Default: Z direction
     }
 
-    std::vector<Vec3>& getNormals() { return normals_; }
+    // Non-const access marks the mesh changed (writes through the reference
+    // are uploaded on the next GPU draw). To only read, use a const Mesh&
+    // (or std::as_const(mesh).getNormals()).
+    std::vector<Vec3>& getNormals() { markChanged(); return normals_; }
     const std::vector<Vec3>& getNormals() const { return normals_; }
     int getNumNormals() const { return static_cast<int>(normals_.size()); }
     bool hasNormals() const { return !normals_.empty(); }
@@ -214,16 +274,24 @@ public:
     // ---------------------------------------------------------------------------
     // Texture coordinates
     // ---------------------------------------------------------------------------
-    void addTexCoord(float u, float v) {
+    Mesh& addTexCoord(float u, float v) {
         texCoords_.push_back(Vec2{u, v});
+        markChanged();
+        return *this;
     }
 
-    void addTexCoord(const Vec2& t) {
+    Mesh& addTexCoord(const Vec2& t) {
         texCoords_.push_back(t);
+        markChanged();
+        return *this;
     }
 
-    std::vector<Vec2>& getTexCoords() { return texCoords_; }
+    // Non-const access marks the mesh changed (writes through the reference
+    // are uploaded on the next GPU draw). To only read, use a const Mesh&
+    // (or std::as_const(mesh).getTexCoords()).
+    std::vector<Vec2>& getTexCoords() { markChanged(); return texCoords_; }
     const std::vector<Vec2>& getTexCoords() const { return texCoords_; }
+    int getNumTexCoords() const { return static_cast<int>(texCoords_.size()); }
     bool hasTexCoords() const { return !texCoords_.empty(); }
     bool hasValidTexCoords() const {
         return hasTexCoords() && texCoords_.size() >= vertices_.size();
@@ -235,19 +303,28 @@ public:
     // Vec4: xyz = tangent direction along texture U axis,
     //       w   = bitangent sign (+1 or -1) for handedness.
     // Bitangent is reconstructed in the shader: B = cross(N, T.xyz) * T.w
-    void addTangent(float tx, float ty, float tz, float tw = 1.0f) {
+    Mesh& addTangent(float tx, float ty, float tz, float tw = 1.0f) {
         tangents_.push_back(Vec4{tx, ty, tz, tw});
+        markChanged();
+        return *this;
     }
 
-    void addTangent(const Vec4& t) {
+    Mesh& addTangent(const Vec4& t) {
         tangents_.push_back(t);
+        markChanged();
+        return *this;
     }
 
-    void addTangent(const Vec3& t, float w = 1.0f) {
+    Mesh& addTangent(const Vec3& t, float w = 1.0f) {
         tangents_.push_back(Vec4{t.x, t.y, t.z, w});
+        markChanged();
+        return *this;
     }
 
-    std::vector<Vec4>& getTangents() { return tangents_; }
+    // Non-const access marks the mesh changed (writes through the reference
+    // are uploaded on the next GPU draw). To only read, use a const Mesh&
+    // (or std::as_const(mesh).getTangents()).
+    std::vector<Vec4>& getTangents() { markChanged(); return tangents_; }
     const std::vector<Vec4>& getTangents() const { return tangents_; }
     int getNumTangents() const { return static_cast<int>(tangents_.size()); }
     bool hasTangents() const { return !tangents_.empty(); }
@@ -255,41 +332,46 @@ public:
     // ---------------------------------------------------------------------------
     // Clear
     // ---------------------------------------------------------------------------
-    void clear() {
+    Mesh& clear() {
         vertices_.clear();
         normals_.clear();
         colors_.clear();
         indices_.clear();
         texCoords_.clear();
         tangents_.clear();
+        markChanged();
+        return *this;
     }
 
-    void clearVertices() { vertices_.clear(); }
-    void clearNormals() { normals_.clear(); }
-    void clearColors() { colors_.clear(); }
-    void clearIndices() { indices_.clear(); }
-    void clearTexCoords() { texCoords_.clear(); }
-    void clearTangents() { tangents_.clear(); }
+    Mesh& clearVertices() { vertices_.clear(); markChanged(); return *this; }
+    Mesh& clearNormals() { normals_.clear(); markChanged(); return *this; }
+    Mesh& clearColors() { colors_.clear(); markChanged(); return *this; }
+    Mesh& clearIndices() { indices_.clear(); markChanged(); return *this; }
+    Mesh& clearTexCoords() { texCoords_.clear(); markChanged(); return *this; }
+    Mesh& clearTangents() { tangents_.clear(); markChanged(); return *this; }
 
     // ---------------------------------------------------------------------------
     // Transform
     // ---------------------------------------------------------------------------
 
     /// Translate all vertices
-    void translate(float x, float y, float z) {
+    Mesh& translate(float x, float y, float z) {
         for (auto& v : vertices_) {
             v.x += x;
             v.y += y;
             v.z += z;
         }
+        markChanged();
+        return *this;
     }
 
-    void translate(const Vec3& offset) {
+    Mesh& translate(const Vec3& offset) {
         translate(offset.x, offset.y, offset.z);
+        return *this;
     }
 
     /// Rotate around X axis (radians)
-    void rotateX(float radians) {
+    Mesh& rotateX(float radians) {
         float c = std::cos(radians);
         float s = std::sin(radians);
         for (auto& v : vertices_) {
@@ -304,10 +386,12 @@ public:
             n.y = y;
             n.z = z;
         }
+        markChanged();
+        return *this;
     }
 
     /// Rotate around Y axis (radians)
-    void rotateY(float radians) {
+    Mesh& rotateY(float radians) {
         float c = std::cos(radians);
         float s = std::sin(radians);
         for (auto& v : vertices_) {
@@ -322,10 +406,12 @@ public:
             n.x = x;
             n.z = z;
         }
+        markChanged();
+        return *this;
     }
 
     /// Rotate around Z axis (radians)
-    void rotateZ(float radians) {
+    Mesh& rotateZ(float radians) {
         float c = std::cos(radians);
         float s = std::sin(radians);
         for (auto& v : vertices_) {
@@ -340,10 +426,12 @@ public:
             n.x = x;
             n.y = y;
         }
+        markChanged();
+        return *this;
     }
 
     /// Scale all vertices
-    void scale(float x, float y, float z) {
+    Mesh& scale(float x, float y, float z) {
         for (auto& v : vertices_) {
             v.x *= x;
             v.y *= y;
@@ -363,14 +451,22 @@ public:
                 }
             }
         }
+        markChanged();
+        return *this;
     }
 
-    void scale(float s) {
+    Mesh& scale(float s) {
         scale(s, s, s);
+        return *this;
+    }
+
+    Mesh& scale(const Vec3& s) {
+        scale(s.x, s.y, s.z);
+        return *this;
     }
 
     /// Apply transformation matrix to all vertices and normals
-    void transform(const Mat4& m) {
+    Mesh& transform(const Mat4& m) {
         for (auto& v : vertices_) {
             v = m * v;
         }
@@ -390,6 +486,8 @@ public:
                 n.z = transformed.z / len;
             }
         }
+        markChanged();
+        return *this;
     }
 
     // ---------------------------------------------------------------------------
@@ -397,8 +495,11 @@ public:
     // ---------------------------------------------------------------------------
 
     /// Append another mesh to this mesh
-    void append(const Mesh& other) {
-        if (other.vertices_.empty()) return;
+    Mesh& append(const Mesh& other) {
+        if (other.vertices_.empty()) {
+            markChanged();
+            return *this;
+        }
 
         unsigned int baseIndex = static_cast<unsigned int>(vertices_.size());
 
@@ -431,6 +532,8 @@ public:
         for (auto idx : other.indices_) {
             indices_.push_back(idx + baseIndex);
         }
+        markChanged();
+        return *this;
     }
 
     // ---------------------------------------------------------------------------
@@ -439,10 +542,18 @@ public:
     void draw() const {
         if (vertices_.empty()) return;
 
+        // GPU point path: a Points-mode mesh lives in a GPU buffer and is drawn
+        // GPU-resident (see tcMeshPointPipeline.h) — Square/Round as billboarded
+        // splats, Pixel as a true 1px point primitive.
+        if (mode_ == PrimitiveMode::Points) {
+            drawGpuPoints();
+            return;
+        }
+
         // GPU PBR path: requires normals and a Material.
         // Evaluated per-pixel on the GPU via the meshPbr shader.
         if (hasNormals() && normals_.size() >= vertices_.size() &&
-            internal::currentMaterial) {
+            internal::currentWindowContext().currentMaterial) {
             drawGpuPbr();
             return;
         }
@@ -468,7 +579,7 @@ public:
 
         bool useColors = hasColors() && colors_.size() >= vertices_.size();
         bool useIndices = hasIndices();
-        Color defColor = getDefaultContext().getColor();
+        Color defColor = getColor();
         auto& writer = internal::getActiveWriter();
 
         // Convert PrimitiveMode to PrimitiveType and begin
@@ -536,9 +647,9 @@ public:
         }
 
         // Get current transformation matrix
-        Mat4 modelMatrix = getDefaultContext().getCurrentMatrix();
+        Mat4 modelMatrix = getDefaultContext().getMatrix();
 
-        const Material& baseMaterial = *internal::currentMaterial;
+        const Material& baseMaterial = *internal::currentWindowContext().currentMaterial;
         bool useVertexColors = hasColors() && colors_.size() >= vertices_.size();
 
         sgl_begin_triangles();
@@ -612,7 +723,7 @@ public:
         bool useColors = hasColors() && colors_.size() >= vertices_.size();
         bool useIndices = hasIndices();
         bool useTexCoords = hasValidTexCoords();
-        Color defColor = getDefaultContext().getColor();
+        Color defColor = getColor();
 
         // Enable texture
         texture.bind();
@@ -689,7 +800,7 @@ public:
             return;
         }
 
-        Color defColor = getDefaultContext().getColor();
+        Color defColor = getColor();
         sgl_begin_lines();
 
         if (hasIndices()) {
@@ -742,7 +853,7 @@ private:
     void drawTriangleFan(bool useColors, bool useIndices) const {
         if (vertices_.size() < 3) return;
 
-        Color defColor = getDefaultContext().getColor();
+        Color defColor = getColor();
         auto& writer = internal::getActiveWriter();
         writer.begin(PrimitiveType::Triangles);
 
@@ -785,7 +896,7 @@ private:
     void drawLineLoop(bool useColors, bool useIndices) const {
         if (vertices_.size() < 2) return;
 
-        Color defColor = getDefaultContext().getColor();
+        Color defColor = getColor();
         auto& writer = internal::getActiveWriter();
         writer.begin(PrimitiveType::LineStrip);
 
@@ -944,23 +1055,25 @@ public:
     // Mesh owns optional sg_buffer handles which are created lazily on the
     // first GpuPbr draw and kept alive until the Mesh is destroyed.
     //
-    // The buffers are marked dirty automatically when the vertex or index
-    // vector size changes. For in-place modifications that don't change size
-    // (e.g. writing directly into getVertices()[i].x), call markGpuDirty()
-    // explicitly before the next draw.
+    // Every mutator (clear*/add*/set*/translate/rotate*/scale/transform/
+    // append/setMode) and every non-const getter bumps a data revision. The
+    // revision is recorded at upload time (separately for the PBR buffers and
+    // the Points buffer); a draw re-uploads when the recorded revision differs
+    // from the current one. markGpuDirty() is not needed after normal edits.
+    // If a mutable reference is kept across draws, call markGpuDirty() after
+    // later writes through it: only fetching the reference bumps the revision.
 
-    // Force a re-upload on the next GpuPbr draw.
-    void markGpuDirty() const { gpuDirty_ = true; }
+    // Force a re-upload on the next GpuPbr / GpuPoints draw.
+    void markGpuDirty() const { markChanged(); }
+
+    // Current data revision. Changes whenever the mesh data is changed (see
+    // above). Compare with != only; the value itself has no meaning.
+    uint64_t getDataRevision() const { return dataRevision_; }
 
     // Upload interleaved (pos, normal, uv) data to a sg_buffer. Lazy; no-op if
     // already clean and sizes match. Called automatically from drawGpuPbr().
     void uploadToGpu() const {
-        // Detect external mutation via size change (best effort)
-        if (static_cast<int>(vertices_.size()) != gpuVertexCount_ ||
-            static_cast<int>(indices_.size()) != gpuIndexCount_) {
-            gpuDirty_ = true;
-        }
-        if (!gpuDirty_) return;
+        if (vbuf_.id != 0 && gpuRevision_ == dataRevision_) return;
         if (vertices_.empty()) return;
 
         // Pack interleaved: pos(3) + normal(3) + uv(2) + tangent(4) = 48 bytes
@@ -1021,12 +1134,49 @@ public:
             gpuIndexCount_ = 0;
         }
 
-        gpuDirty_ = false;
+        gpuRevision_ = dataRevision_;
     }
 
     // Draw via the GPU PBR pipeline. Defined in tcMeshPbrPipeline.h which is
     // included after this file by TrussC.h.
     void drawGpuPbr() const;
+
+    // Draw via the GPU point-splat pipeline. Defined in tcMeshPointPipeline.h
+    // (included after this file). Used for PrimitiveMode::Points with a non-Pixel
+    // PointStyle.
+    void drawGpuPoints() const;
+
+    // Upload per-point instance data (pos3 + color4 = 28 bytes) to pbuf_. Lazy;
+    // no-op when clean and the point count is unchanged. Uncolored points get
+    // white so the shader's tint (the current draw color) shows through. Called
+    // from drawGpuPoints().
+    void uploadPointsToGpu() const {
+        if (pbuf_.id != 0 && pointGpuRevision_ == dataRevision_) return;
+        if (vertices_.empty()) return;
+
+        const int n = static_cast<int>(vertices_.size());
+        const bool haveColor = hasColors() && colors_.size() >= vertices_.size();
+        pointPacked_.resize(static_cast<size_t>(n) * 7);
+        for (int i = 0; i < n; ++i) {
+            float* o = &pointPacked_[static_cast<size_t>(i) * 7];
+            o[0] = vertices_[i].x; o[1] = vertices_[i].y; o[2] = vertices_[i].z;
+            if (haveColor) {
+                o[3] = colors_[i].r; o[4] = colors_[i].g;
+                o[5] = colors_[i].b; o[6] = colors_[i].a;
+            } else {
+                o[3] = 1.0f; o[4] = 1.0f; o[5] = 1.0f; o[6] = 1.0f;
+            }
+        }
+
+        if (pbuf_.id != 0) { internal::deferGpuDestroy(pbuf_); pbuf_ = {}; }
+        sg_buffer_desc pbd = {};
+        pbd.data.ptr  = pointPacked_.data();
+        pbd.data.size = pointPacked_.size() * sizeof(float);
+        pbd.label = "tc_mesh_point_vbuf";
+        pbuf_ = sg_make_buffer(&pbd);
+        gpuPointCount_ = n;
+        pointGpuRevision_ = dataRevision_;
+    }
 
     // Accessors used by PbrPipeline
     sg_buffer getGpuVertexBuffer() const { return vbuf_; }
@@ -1034,19 +1184,34 @@ public:
     int getGpuVertexCount() const { return gpuVertexCount_; }
     int getGpuIndexCount() const { return gpuIndexCount_; }
 
+    // Accessors used by PointPipeline
+    sg_buffer getGpuPointBuffer() const { return pbuf_; }
+    int getGpuPointCount() const { return gpuPointCount_; }
+
 private:
+    // Bump the data revision. Unsigned wrap-around is well defined, and the
+    // upload check only uses ==, so a wrap cannot cause a missed upload unless
+    // exactly 2^64 changes happen between two uploads.
+    void markChanged() const { ++dataRevision_; }
+
     void releaseGpuBuffers() const {
+        // Deferred destroy: a deferred draw command recorded this frame may
+        // still hold these handles (see internal::deferGpuDestroy in tcGpuDestroyQueue.h).
         if (vbuf_.id != 0) {
-            sg_destroy_buffer(vbuf_);
+            internal::deferGpuDestroy(vbuf_);
             vbuf_ = {};
         }
         if (ibuf_.id != 0) {
-            sg_destroy_buffer(ibuf_);
+            internal::deferGpuDestroy(ibuf_);
             ibuf_ = {};
+        }
+        if (pbuf_.id != 0) {
+            internal::deferGpuDestroy(pbuf_);
+            pbuf_ = {};
         }
         gpuVertexCount_ = 0;
         gpuIndexCount_ = 0;
-        gpuDirty_ = true;
+        gpuPointCount_ = 0;
     }
 
     PrimitiveMode mode_;
@@ -1063,7 +1228,40 @@ private:
     mutable sg_buffer ibuf_{};
     mutable int gpuVertexCount_{0};
     mutable int gpuIndexCount_{0};
-    mutable bool gpuDirty_{true};
+
+    // Data revision (bumped by markChanged()) and the revision each GPU buffer
+    // was uploaded from. A buffer is re-uploaded when its id is 0 or its
+    // recorded revision differs from dataRevision_.
+    mutable uint64_t dataRevision_{1};
+    mutable uint64_t gpuRevision_{0};
+
+    // GPU instance buffer for the point-splat path (PrimitiveMode::Points).
+    // Packs pos(3) + color(4) per point; independent of the PBR buffers above.
+    mutable sg_buffer pbuf_{};
+    mutable int gpuPointCount_{0};
+    mutable uint64_t pointGpuRevision_{0};
+    mutable std::vector<float> pointPacked_;   // reused scratch for the upload
 };
+
+// Out-of-line: needs the complete Mesh type. Builds a flat (z=0) filled mesh from
+// the path contours using the same tessellation as Path::drawFill() (non-zero
+// winding, holes, self-intersection splitting). Normals face +Z and UVs are zero,
+// so it drops straight into the unlit or PBR-lit mesh draw paths.
+inline Mesh Path::toFillMesh() const {
+    Mesh mesh;
+    mesh.setMode(PrimitiveMode::Triangles);
+    const std::vector<std::array<float, 2>> tris = buildFillTriangles();
+    unsigned int base = 0;
+    for (size_t i = 0; i + 2 < tris.size(); i += 3) {
+        for (int k = 0; k < 3; ++k) {
+            mesh.addVertex(tris[i + k][0], tris[i + k][1], 0.0f);
+            mesh.addNormal(0.0f, 0.0f, 1.0f);
+            mesh.addTexCoord(0.0f, 0.0f);
+        }
+        mesh.addTriangle(base, base + 1, base + 2);
+        base += 3;
+    }
+    return mesh;
+}
 
 } // namespace trussc

@@ -53,7 +53,7 @@ when defined(windows):
   else:
     switch("cc", "clang_cl")
   switch("passC", "/INCREMENTAL")
-  switch("passC", "/std:c++17")
+  switch("passC", "/std:c++20")
   switch("passC", "/utf-8")
   switch("passC", "/MD")
   if use_vcc:

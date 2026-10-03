@@ -9,6 +9,7 @@
 #include <sstream>
 #include "pugixml/pugixml.hpp"
 #include "tcLog.h"
+#include "tcUtils.h"   // getDataPath
 
 namespace trussc {
 
@@ -25,16 +26,19 @@ class Xml {
 public:
     Xml() = default;
 
-    // Load from file
-    bool load(const std::string& path) {
-        XmlParseResult result = doc_.load_file(path.c_str());
+    // Load from file (relative paths resolved via getDataPath, like loadJson)
+    bool load(const fs::path& path) {
+        fs::path fullPath = getDataPath(path);
+        // fullPath.c_str() is wchar_t* on Windows — pugixml has a wide
+        // load_file overload there, so non-ASCII paths survive.
+        XmlParseResult result = doc_.load_file(fullPath.c_str());
         if (!result) {
             logError() << "XML load error: " << path
                          << " - " << result.description()
                          << " (offset: " << result.offset << ")";
             return false;
         }
-        logVerbose() << "XML loaded: " << path;
+        logVerbose() << "XML loaded: " << fullPath;
         return true;
     }
 
@@ -49,14 +53,32 @@ public:
         return true;
     }
 
-    // Save to file
-    bool save(const std::string& path, const std::string& indent = "  ") const {
-        bool success = doc_.save_file(path.c_str(), indent.c_str());
+    // Save to file (relative paths resolved via getDataPath, like saveJson;
+    // a missing parent folder is created)
+    bool save(const fs::path& path, const std::string& indent = "  ") const {
+        fs::path fullPath = getDataPath(path);
+        // "" or "out/": fail before creating any folder
+        if (fullPath.filename().empty()) {
+            logError() << "No file name in XML file path: " << fullPath;
+            return false;
+        }
+        std::error_code ec;
+        fs::path parent = fullPath.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                logError() << "Cannot create folder for XML file: " << parent
+                           << " (" << ec.message() << ")";
+                return false;
+            }
+        }
+        // Wide save_file overload on Windows (see load)
+        bool success = doc_.save_file(fullPath.c_str(), indent.c_str());
         if (!success) {
             logError() << "XML write error: " << path;
             return false;
         }
-        logVerbose() << "XML saved: " << path;
+        logVerbose() << "XML saved: " << fullPath;
         return true;
     }
 
@@ -111,7 +133,7 @@ private:
 // ---------------------------------------------------------------------------
 
 // Load XML from file
-inline Xml loadXml(const std::string& path) {
+inline Xml loadXml(const fs::path& path) {
     Xml xml;
     xml.load(path);
     return xml;

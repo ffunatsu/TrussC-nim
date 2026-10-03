@@ -15,22 +15,88 @@
 //   5. tc/gpu/shaders/meshPbr.glsl.h (generated sokol-shdc output)
 //   6. tcMeshPbrPipeline.h        (this file; defines Mesh::drawGpuPbr())
 //
-// v1 limitations:
-//   - Swapchain target only. Drawing PBR mesh inside an Fbo pass will trigger
-//     a sokol_gfx pipeline format mismatch. Phase 4 will add per-target cache.
-//   - Immediate-mode sg_draw; ordering with sokol_gl is "PBR below 2D overlay".
-//     See plan for the deferred-layer optimization (Phase later).
+// Draw submission:
+//   - Pipelines are cached per (color format, sample count), so both the
+//     swapchain and Fbo passes are supported render targets.
+//   - ALL PBR draws are deferred: swapchain draws into the per-layer flush
+//     (flushDeferredShaderDraws), FBO-pass draws into fboPbrDraws (flushed at
+//     Fbo::end()), so they composite with sokol_gl 2D in submission order.
+//     Captured sg_buffer handles stay valid because Mesh defers buffer
+//     destruction to end of frame (internal::deferGpuDestroy,
+//     tcGpuDestroyQueue.h).
 //
 // =============================================================================
 
 #include <cstring>
 #include <map>
+#include <vector>
 
 #include "tc/gpu/shaders/meshPbr.glsl.h"
 #include "tc/gpu/shaders/shadowDepth.glsl.h"
+#include "tc/graphics/tcClipSpace.h"
 
 namespace trussc {
 namespace internal {
+
+// A fully-resolved PBR mesh draw, captured at submission time (pipeline +
+// bindings + packed uniforms) so it can be replayed later. Used to defer
+// swapchain PBR draws into the same per-layer flush as sokol_gl 2D and deferred
+// shaders, so everything composites in submission order. See PbrPipeline::drawMesh.
+struct PbrDrawCommand {
+    sg_pipeline        pip;
+    sg_bindings        bind;
+    tc_pbr_vs_params_t vsp;
+    tc_pbr_fs_params_t fsp;
+    int                indexCount;
+    int                vertexCount;
+};
+
+// Which registered lights get the PBR shader's single projector slot and
+// single IES slot. The projector slot goes to the first Spot light with a
+// projection texture, the IES slot to the first light with an IES profile,
+// both among the first maxLights entries (the ones the shader sees). The
+// overflow flags are set when a further light of that kind gets no slot.
+// Pure (no GPU access), so it is testable headless.
+struct PbrSpecialLightSlots {
+    int projectorIndex = -1;          // index into the light list, -1 = none
+    int iesIndex = -1;                // index into the light list, -1 = none
+    bool projectorOverflow = false;   // another projector light got no slot
+    bool iesOverflow = false;         // another IES light got no slot
+};
+
+inline PbrSpecialLightSlots selectPbrSpecialLightSlots(const std::vector<Light*>& lights) {
+    PbrSpecialLightSlots r;
+    int n = static_cast<int>(lights.size());
+    if (n > maxLights) n = maxLights;
+    for (int i = 0; i < n; ++i) {
+        const Light& L = *lights[i];
+        if (L.getType() == LightType::Spot && L.hasProjectionTexture()) {
+            if (r.projectorIndex < 0) r.projectorIndex = i;
+            else r.projectorOverflow = true;
+        }
+        if (L.hasIesProfile()) {
+            if (r.iesIndex < 0) r.iesIndex = i;
+            else r.iesOverflow = true;
+        }
+    }
+    return r;
+}
+struct DeferredPbrDraw { int layerId; PbrDrawCommand cmd; };
+// deferredPbrDraws (swapchain) is now PER-WINDOW, held in WindowContext
+// (tc/app/tcWindowContext.h) and reached via currentWindowContext(). Replayed
+// per sokol_gl layer by flushDeferredShaderDraws() (tcShader.h).
+
+// PBR draws deferred WITHIN an FBO pass. Flushed at Fbo::end()/clearColor() via
+// flushFboDeferredPbr(), which interleaves them with the FBO context's sokol_gl
+// layers using sgl_context_draw_layer() — each layer drawn once (O(N)). This
+// replaces the old per-mesh sgl_draw() in the FBO path, which redrew the whole
+// FBO context on every mesh (O(N^2)) and overflowed the per-frame uniform buffer
+// once enough meshes were in flight.
+// fboPbrDraws (PBR draws deferred WITHIN an FBO pass) is now PER-WINDOW, held in
+// WindowContext and reached via currentWindowContext(); flushed per-layer by
+// flushFboDeferredPbr() below. The shared FBO-pass layer counter fboLayerNext is
+// likewise a WindowContext member (used by both this pipeline and the point
+// pipeline).
 
 class PbrPipeline {
 public:
@@ -38,6 +104,7 @@ public:
     void ensureInit() {
         if (initialized_) return;
         shader_ = sg_make_shader(tc_pbr_pbr_mesh_shader_desc(sg_query_backend()));
+        shaderReady_ = internal::internalShaderReady(shader_, "PBR");
         initialized_ = true;
     }
 
@@ -77,31 +144,30 @@ public:
     // Assumes mesh has uploaded GPU buffers and currentMaterial is set.
     void drawMesh(const Mesh& mesh) {
         ensureInit();
+        if (!shaderReady_) return;   // warned once in ensureInit()
+
+        // Lighting / material / environment / shadow state is all per-window.
+        auto& wctx = internal::currentWindowContext();
+        auto& activeLights = wctx.activeLights;
+        auto& sh = wctx.shadow;
 
         // 現在のレンダーターゲットのカラーフォーマットとサンプルカウントを取得
         // _SG_PIXELFORMAT_DEFAULT (0) = sokol環境デフォルト（スワップチェーン）
         // SG_PIXELFORMAT_NONE (1) は「カラーアタッチメントなし」なので使わない
         sg_pixel_format colorFmt;
         int sampleCount;
-        if (internal::inFboPass) {
-            colorFmt = internal::currentFboColorFormat;
-            sampleCount = internal::currentFboSampleCount;
+        if (wctx.inFboPass) {
+            colorFmt = wctx.currentFboColorFormat;
+            sampleCount = wctx.currentFboSampleCount;
         } else {
             colorFmt = _SG_PIXELFORMAT_DEFAULT;
             sampleCount = sapp_sample_count();
         }
 
-        // Ensure we are inside a render pass
-        if (!internal::inFboPass) {
-            ensureSwapchainPass();
-        }
-
-        // Flush any pending sokol_gl commands so they are drawn *before* this
-        // PBR mesh. This preserves "drawBox → mesh.draw() → drawBox" intent
-        // where the first drawBox should appear beneath the PBR mesh.
-        sgl_draw();
-
-        sg_apply_pipeline(getPipeline(colorFmt, sampleCount));
+        // Resolve the pipeline now; GPU submission happens at the end of this
+        // function — deferred for the swapchain (so it composites with sokol_gl
+        // in submission order), immediate inside an FBO pass.
+        sg_pipeline pip = getPipeline(colorFmt, sampleCount);
 
         // --- Bindings -------------------------------------------------------
         sg_bindings bind = {};
@@ -114,7 +180,7 @@ public:
         // valid view/sampler handles because sokol-gfx validates bindings;
         // fall back to whatever the environment-less defaults are on the GPU
         // (a 1x1 black cubemap / 2D texture held by the pipeline singleton).
-        Environment* env = internal::currentEnvironment;
+        Environment* env = wctx.currentEnvironment;
         bool hasIbl = (env != nullptr && env->isLoaded());
         ensureFallbacks();
         if (hasIbl) {
@@ -134,22 +200,22 @@ public:
         }
 
         // Material reference (used for both normal map binding and uniform packing)
-        const Material& pbrMat = *internal::currentMaterial;
+        const Material& pbrMat = *wctx.currentMaterial;
 
-        // Find the first projector-type light and the first IES-profiled light
-        int nActiveLights = static_cast<int>(internal::activeLights.size());
-        if (nActiveLights > internal::maxLights) nActiveLights = internal::maxLights;
-        int projectorLightIdx = -1;
-        int iesLightIdx = -1;
-        for (int i = 0; i < nActiveLights; ++i) {
-            const Light& L = *internal::activeLights[i];
-            if (projectorLightIdx < 0 &&
-                L.getType() == LightType::Spot && L.hasProjectionTexture()) {
-                projectorLightIdx = i;
-            }
-            if (iesLightIdx < 0 && L.hasIesProfile()) {
-                iesLightIdx = i;
-            }
+        // The shader has one projector slot and one IES slot: the first
+        // projector light and the first IES light get them.
+        const PbrSpecialLightSlots slots = selectPbrSpecialLightSlots(activeLights);
+        const int projectorLightIdx = slots.projectorIndex;
+        const int iesLightIdx = slots.iesIndex;
+        if (slots.projectorOverflow && projectorSlotWarned_.isFirstTime()) {
+            logWarning("TrussC") << "PBR: more than one projector light (Spot "
+                << "light with setProjectionTexture()); only the first gets the "
+                << "projector slot, the others light as plain spot lights";
+        }
+        if (slots.iesOverflow && iesSlotWarned_.isFirstTime()) {
+            logWarning("TrussC") << "PBR: more than one light with an IES "
+                << "profile; only the first gets the IES slot, the others light "
+                << "without their profile";
         }
 
         // Normal map from Material (or fallback flat normal)
@@ -164,7 +230,7 @@ public:
 
         // Projector texture (or fallback)
         if (projectorLightIdx >= 0) {
-            const Texture* pTex = internal::activeLights[projectorLightIdx]->getProjectionTexture();
+            const Texture* pTex = activeLights[projectorLightIdx]->getProjectionTexture();
             bind.views[VIEW_tc_pbr_projectorTex]       = pTex->getView();
             bind.samplers[SMP_tc_pbr_projectorTexSmp]  = pTex->getSampler();
         } else {
@@ -174,7 +240,7 @@ public:
 
         // IES profile texture (or fallback white = no angular modulation)
         if (iesLightIdx >= 0) {
-            const IesProfile* ies = internal::activeLights[iesLightIdx]->getIesProfile();
+            const IesProfile* ies = activeLights[iesLightIdx]->getIesProfile();
             bind.views[VIEW_tc_pbr_iesProfileTex]       = ies->getView();
             bind.samplers[SMP_tc_pbr_iesProfileTexSmp]  = ies->getSampler();
         } else {
@@ -197,23 +263,24 @@ public:
         bindMatTex(VIEW_tc_pbr_emissiveTex,           SMP_tc_pbr_emissiveTexSmp,           pbrMat.getEmissiveTexture());
         bindMatTex(VIEW_tc_pbr_occlusionTex,          SMP_tc_pbr_occlusionTexSmp,          pbrMat.getOcclusionTexture());
 
-        // Shadow map texture (or fallback white = fully lit)
-        if (shadowLightIndex_ >= 0 && shadowColorTexView_.id != 0) {
+        // Shadow map texture array (or fallback array = never sampled because
+        // the shader sees numShadowSlots == 0)
+        if (sh.count > 0 && shadowColorTexView_.id != 0) {
             bind.views[VIEW_tc_pbr_shadowMap]      = shadowColorTexView_;
             bind.samplers[SMP_tc_pbr_shadowMapSmp] = shadowSampler_;
         } else {
-            bind.views[VIEW_tc_pbr_shadowMap]      = fallbackWhiteView_;
+            bind.views[VIEW_tc_pbr_shadowMap]      = fallbackShadowArrayView_;
             bind.samplers[SMP_tc_pbr_shadowMapSmp] = fallbackSampler_;
         }
 
-        sg_apply_bindings(&bind);
+        // (bindings applied later, in executePbrDraw)
 
         // --- vs_params ------------------------------------------------------
         tc_pbr_vs_params_t vsp = {};
         // TrussC Mat4 is row-major; GLSL mat4 is column-major. Transpose the
         // storage before upload so shader can use the conventional `model * v`.
-        Mat4 modelT = getDefaultContext().getCurrentMatrix().transposed();
-        Mat4 viewProj = internal::currentProjectionMatrix * internal::currentViewMatrix;
+        Mat4 modelT = getDefaultContext().getMatrix().transposed();
+        Mat4 viewProj = wctx.currentProjectionMatrix * wctx.currentViewMatrix;
         Mat4 viewProjT = viewProj.transposed();
         // For now, normal matrix is just the model matrix. This is correct for
         // rotations and uniform scale; non-uniform scale would need
@@ -223,9 +290,6 @@ public:
         std::memcpy(vsp.model,     modelT.m,     sizeof(vsp.model));
         std::memcpy(vsp.viewProj,  viewProjT.m,  sizeof(vsp.viewProj));
         std::memcpy(vsp.normalMat, normalMatT.m, sizeof(vsp.normalMat));
-
-        sg_range vsRange = { &vsp, sizeof(vsp) };
-        sg_apply_uniforms(UB_tc_pbr_vs_params, &vsRange);
 
         // --- fs_params ------------------------------------------------------
         tc_pbr_fs_params_t fsp = {};
@@ -244,8 +308,8 @@ public:
         fsp.emissive[2] = em.b;
         fsp.emissive[3] = 0.0f;
 
-        const Vec3& cam = internal::cameraPosition;
-        int numLights = static_cast<int>(internal::activeLights.size());
+        const Vec3& cam = wctx.cameraPosition;
+        int numLights = static_cast<int>(activeLights.size());
         if (numLights > internal::maxLights) numLights = internal::maxLights;
         fsp.cameraPos[0] = cam.x;
         fsp.cameraPos[1] = cam.y;
@@ -255,11 +319,11 @@ public:
         // iblParams: x=hasIbl, y=prefilterMaxLod, z=exposure, w=hasNormalMap
         fsp.iblParams[0] = hasIbl ? 1.0f : 0.0f;
         fsp.iblParams[1] = hasIbl ? static_cast<float>(env->getPrefilterMipLevels() - 1) : 0.0f;
-        fsp.iblParams[2] = internal::pbrExposure;
+        fsp.iblParams[2] = wctx.pbrExposure;
         fsp.iblParams[3] = hasNormalMap ? 1.0f : 0.0f;
 
         for (int i = 0; i < numLights; i++) {
-            const Light& L = *internal::activeLights[i];
+            const Light& L = *activeLights[i];
             if (L.getType() == LightType::Directional) {
                 const Vec3& d = L.getDirection();
                 fsp.lightPosType[i][0] = d.x;
@@ -309,7 +373,7 @@ public:
         // Projector VP matrix (single projector, first spot with texture)
         fsp.projectorParams[0] = static_cast<float>(projectorLightIdx);
         if (projectorLightIdx >= 0) {
-            Mat4 pvp = internal::activeLights[projectorLightIdx]->computeProjectorViewProj();
+            Mat4 pvp = activeLights[projectorLightIdx]->computeProjectorViewProj();
             Mat4 pvpT = pvp.transposed();
             std::memcpy(fsp.projectorViewProj, pvpT.m, sizeof(fsp.projectorViewProj));
         }
@@ -317,7 +381,7 @@ public:
         // IES profile params
         fsp.iesParams[0] = static_cast<float>(iesLightIdx);
         if (iesLightIdx >= 0) {
-            fsp.iesParams[1] = internal::activeLights[iesLightIdx]->getIesProfile()->getMaxVerticalAngle();
+            fsp.iesParams[1] = activeLights[iesLightIdx]->getIesProfile()->getMaxVerticalAngle();
             fsp.iesParams[2] = 0.0f;
             fsp.iesParams[3] = 0.0f;
         }
@@ -328,27 +392,79 @@ public:
         fsp.texFlags[2] = pbrMat.hasEmissiveTexture()           ? 1.0f : 0.0f;
         fsp.texFlags[3] = pbrMat.hasOcclusionTexture()          ? 1.0f : 0.0f;
 
-        // Shadow map VP matrix and params
-        fsp.shadowParams[0] = static_cast<float>(shadowLightIndex_);
-        if (shadowLightIndex_ >= 0) {
-            Mat4 svpT = shadowViewProj_.transposed();
-            std::memcpy(fsp.shadowViewProj, svpT.m, sizeof(fsp.shadowViewProj));
-            fsp.shadowParams[1] = internal::activeLights[shadowLightIndex_]->getShadowBias();
-            fsp.shadowParams[2] = static_cast<float>(shadowTexResolution_);
-            fsp.shadowParams[3] = 1.0f;    // shadow strength
-        } else {
-            fsp.shadowParams[0] = -1.0f;
+        // Shadow slots: per-slot light VP matrices and params, packed by VALUE
+        // so deferred draws replay with the shadow state that was current at
+        // submission time (issue #192). The array texture VIEW is shared, but
+        // each light's layer is rendered exactly once per frame before the
+        // material draws that use it, so the layer content matches the matrix.
+        // Slot data refreshes every frame that runs a shadow pass. Draws
+        // submitted before the first shadow pass of a frame may still use the
+        // previous frame's slots (intentional, one frame old at most). If the
+        // slots are older than that, the app stopped calling beginShadowPass()
+        // entirely -- expose zero slots instead of ghost shadows from a stale
+        // map (the per-frame slot reset only runs inside beginShadowPass()).
+        // Per-window shadow key (Fix 3/5): getFrameCount() is the CURRENT
+        // window's updateCount, and sh is this window's slot state.
+        int liveSlotCount = (sh.frame + 1 >= getFrameCount()) ? sh.count : 0;
+        fsp.shadowMapParams[0] = static_cast<float>(shadowTexResolution_);
+        fsp.shadowMapParams[1] = static_cast<float>(liveSlotCount);
+        // z flags a top-left-origin backend (Metal / D3D11 / WebGPU): the
+        // shader must v-flip its shadow UV to sample the offscreen map
+        // correctly (GL convention otherwise).
+        fsp.shadowMapParams[2] = sg_query_features().origin_top_left ? 1.0f : 0.0f;
+        for (int s = 0; s < liveSlotCount; s++) {
+            Mat4 svpT = sh.viewProj[s].transposed();
+            std::memcpy(fsp.shadowViewProj[s], svpT.m, sizeof(fsp.shadowViewProj[s]));
+            fsp.shadowSlotParams[s][0] = static_cast<float>(sh.lightIndex[s]);
+            fsp.shadowSlotParams[s][1] = sh.bias[s];
+            fsp.shadowSlotParams[s][2] = 1.0f;    // shadow strength
+            fsp.shadowSlotParams[s][3] = sh.softness[s];  // emitter size (world units, 0 = hard/PCSS off)
+            // x = PCSS variable-PCF tap count (clamped [1,36] at the Light API).
+            // y = depth-storage mode (0=perspective/spot, 1=ortho/directional).
+            // z/w reserved (zero).
+            fsp.shadowSlotParams2[s][0] = static_cast<float>(sh.samples[s]);
+            fsp.shadowSlotParams2[s][1] = sh.mode[s];
+            fsp.shadowSlotParams2[s][2] = 0.0f;
+            fsp.shadowSlotParams2[s][3] = 0.0f;
+            // xyz = light direction (normalized), w = refDot (ortho depth ref).
+            fsp.shadowSlotLightDir[s][0] = sh.lightDirX[s];
+            fsp.shadowSlotLightDir[s][1] = sh.lightDirY[s];
+            fsp.shadowSlotLightDir[s][2] = sh.lightDirZ[s];
+            fsp.shadowSlotLightDir[s][3] = sh.refDot[s];
         }
 
-        sg_range fsRange = { &fsp, sizeof(fsp) };
-        sg_apply_uniforms(UB_tc_pbr_fs_params, &fsRange);
-
-        // --- Draw -----------------------------------------------------------
-        if (mesh.getGpuIndexCount() > 0) {
-            sg_draw(0, mesh.getGpuIndexCount(), 1);
+        // --- Submit ---------------------------------------------------------
+        // Package the fully-resolved draw. Inside an FBO pass we submit it
+        // immediately (that pass is self-contained). For the swapchain we DEFER
+        // it: append to deferredPbrDraws and bump the sokol_gl layer so any 2D
+        // drawn after this mesh composites on top of it (same trick the deferred
+        // shaders use). flushDeferredShaderDraws() replays it per layer.
+        PbrDrawCommand cmd{ pip, bind, vsp, fsp,
+                            mesh.getGpuIndexCount(), mesh.getGpuVertexCount() };
+        if (wctx.inFboPass) {
+            // Defer (like the swapchain path) into the per-FBO list; flushed
+            // per-layer in Fbo::end(). Bump the FBO layer so 2D drawn after this
+            // mesh composites on top of it, matching the swapchain ordering.
+            wctx.fboPbrDraws.push_back({ wctx.fboLayerNext, cmd });
+            wctx.fboLayerNext++;
+            sgl_layer(wctx.fboLayerNext);
         } else {
-            sg_draw(0, mesh.getGpuVertexCount(), 1);
+            wctx.deferredPbrDraws.push_back({ wctx.sglLayerNext, cmd });
+            wctx.sglLayerNext++;
+            sgl_layer(wctx.sglLayerNext);
         }
+    }
+
+    // Submit a packaged PBR draw to the GPU. Used immediately for FBO passes and
+    // replayed from flushDeferredShaderDraws() for the swapchain.
+    void executePbrDraw(const PbrDrawCommand& c) {
+        sg_apply_pipeline(c.pip);
+        sg_apply_bindings(&c.bind);
+        sg_range vr{ &c.vsp, sizeof(c.vsp) };
+        sg_apply_uniforms(UB_tc_pbr_vs_params, &vr);
+        sg_range fr{ &c.fsp, sizeof(c.fsp) };
+        sg_apply_uniforms(UB_tc_pbr_fs_params, &fr);
+        sg_draw(0, c.indexCount > 0 ? c.indexCount : c.vertexCount, 1);
     }
 
 private:
@@ -433,6 +549,24 @@ private:
         fallbackIes_ = fallbackWhite_;
         fallbackIesView_ = fallbackWhiteView_;
 
+        // 1x1x1 white ARRAY texture for the shadow map binding when no shadow
+        // pass has run (the shader never samples it — numShadowSlots is 0 —
+        // but sokol-gfx validates that the bound image type matches the
+        // shader's texture2DArray).
+        sg_image_desc sa_desc = {};
+        sa_desc.type = SG_IMAGETYPE_ARRAY;
+        sa_desc.num_slices = 1;
+        sa_desc.width = 1;
+        sa_desc.height = 1;
+        sa_desc.pixel_format = SG_PIXELFORMAT_RGBA8;
+        sa_desc.data.mip_levels[0].ptr = white_pixel;
+        sa_desc.data.mip_levels[0].size = sizeof(white_pixel);
+        sa_desc.label = "tc_pbr_fallback_shadow_array";
+        fallbackShadowArray_ = sg_make_image(&sa_desc);
+        sg_view_desc sa_view_desc = {};
+        sa_view_desc.texture.image = fallbackShadowArray_;
+        fallbackShadowArrayView_ = sg_make_view(&sa_view_desc);
+
         fallbackInitialized_ = true;
     }
 
@@ -442,23 +576,96 @@ private:
 public:
     void beginShadowPass(int lightIndex) {
         ensureShadowInit();
-        const Light& light = *internal::activeLights[lightIndex];
-        ensureShadowTexture(light.getShadowResolution());
+        // No shadow shader (warned once): no pass; sh.inPass stays false, so
+        // shadowDraw()/endShadowPass() are no-ops.
+        if (!shadowReady_) return;
+        auto& wctx = internal::currentWindowContext();
+        auto& sh = wctx.shadow;
+        const Light& light = *wctx.activeLights[lightIndex];
 
-        // Suspend swapchain pass if active
-        if (internal::inSwapchainPass) {
-            sgl_draw();
-            sg_end_pass();
-            internal::inSwapchainPass = false;
+        // Point lights are not supported yet: they need a cube/omni shadow map,
+        // which this single-2D-layer pipeline can't express. Warn once and no-op
+        // cleanly — do NOT claim a slot or begin a pass. sh.inPass stays false
+        // so shadowDraw()/endShadowPass() no-op, and no stale slot is exposed.
+        if (light.getType() == LightType::Point) {
+            if (!shadowPointWarned_) {
+                logWarning("TrussC") << "beginShadowPass: point light shadows not "
+                    << "supported yet; this light casts no shadow";
+                shadowPointWarned_ = true;
+            }
+            // sh.inPass stays false -> shadowDraw()/endShadowPass() no-op
+            return;
         }
 
-        // Compute light VP matrix (reuse spot projector VP)
-        shadowViewProj_ = light.computeProjectorViewProj();
-        shadowLightIndex_ = lightIndex;
+        // Per-frame slot assignment: the slot counter resets on the first
+        // beginShadowPass() of each frame (keyed on getFrameCount()), and each
+        // pass claims the next array layer in call order. Slot data persists
+        // across frames so draws submitted before the first shadow pass of a
+        // frame keep the previous frame's shadow state (same semantics as the
+        // old single-map design).
+        uint64_t frame = getFrameCount();   // per-window updateCount (Fix 3/5)
+        if (frame != sh.frame) {
+            sh.frame = frame;
+            sh.count = 0;
+        }
+        if (sh.count >= internal::maxShadowLights) {
+            if (!shadowOverflowWarned_) {
+                logWarning("TrussC") << "beginShadowPass: more than "
+                    << internal::maxShadowLights << " shadow passes in one "
+                    << "frame; lights beyond the limit cast no shadow";
+                shadowOverflowWarned_ = true;
+            }
+            // sh.inPass stays false -> shadowDraw()/endShadowPass() no-op
+            return;
+        }
+        ensureShadowTexture(light.getShadowResolution());
 
-        // Begin shadow depth pass
+        // Suspend swapchain pass if active. Remember whether one was active so
+        // endShadowPass() only resumes when there is something to resume
+        // (mirrors Fbo::wasInSwapchainPass_ — issue #191: it used to start a
+        // swapchain pass even when none was active before).
+        sh.wasInSwapchainPass = wctx.inSwapchainPass;
+        if (sh.wasInSwapchainPass) {
+            sgl_draw();
+            sg_end_pass();
+            wctx.inSwapchainPass = false;
+        }
+
+        // Claim the next shadow slot for this light. computeShadowViewProj()
+        // returns the perspective projector VP for Spot lights and an ortho box
+        // VP for Directional lights.
+        int slot = sh.count++;
+        sh.current = slot;
+        sh.viewProj[slot]   = light.computeShadowViewProj();
+        sh.lightIndex[slot] = lightIndex;
+        sh.bias[slot]       = light.getShadowBias();
+        sh.softness[slot]   = light.getShadowSoftness();
+        sh.samples[slot]    = light.getShadowSamples();
+
+        // Depth-storage mode + ortho depth reference. For Directional lights the
+        // shadow depth is stored as dot(worldPos, lightDir) - refDot (linear world
+        // units); refDot = dot(eye, lightDir) with eye = center - dir*radius, i.e.
+        // dot(center, dir) - radius. Spot keeps clip.w (mode 0), refDot unused.
+        if (light.getType() == LightType::Directional) {
+            Vec3 dir = light.getDirection().normalized();
+            const Vec3& center = light.getShadowAreaCenter();
+            float radius = light.getShadowAreaRadius();
+            sh.mode[slot]     = 1.0f;
+            sh.lightDirX[slot] = dir.x;
+            sh.lightDirY[slot] = dir.y;
+            sh.lightDirZ[slot] = dir.z;
+            sh.refDot[slot]   = center.dot(dir) - radius;
+        } else {
+            sh.mode[slot]     = 0.0f;
+            sh.lightDirX[slot] = 0.0f;
+            sh.lightDirY[slot] = 0.0f;
+            sh.lightDirZ[slot] = 0.0f;
+            sh.refDot[slot]   = 0.0f;
+        }
+
+        // Begin shadow depth pass into this slot's array layer
         sg_pass pass = {};
-        pass.attachments.colors[0] = shadowColorAttView_;
+        pass.attachments.colors[0] = shadowColorAttView_[slot];
         pass.attachments.depth_stencil = shadowDepthAttView_;
         pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
         pass.action.colors[0].clear_value = { 10000.0f, 0.0f, 0.0f, 1.0f };  // R32F: far distance
@@ -467,15 +674,16 @@ public:
         pass.label = "tc_shadow_pass";
         sg_begin_pass(&pass);
 
-        int res = light.getShadowResolution();
-        sg_apply_viewport(0, 0, res, res, true);
+        // Render at the shared array resolution (max of all requested sizes)
+        sg_apply_viewport(0, 0, shadowTexResolution_, shadowTexResolution_, true);
         sg_apply_pipeline(shadowPipeline_);
 
-        inShadowPass_ = true;
+        sh.inPass = true;
     }
 
     void shadowDrawMesh(const Mesh& mesh) {
-        if (!inShadowPass_) return;
+        auto& sh = internal::currentWindowContext().shadow;
+        if (!sh.inPass) return;
         mesh.uploadToGpu();
         if (mesh.getGpuVertexBuffer().id == 0) return;
 
@@ -486,12 +694,30 @@ public:
         }
         sg_apply_bindings(&bind);
 
-        // Shadow VS uniforms: model + lightViewProj
+        // Shadow VS uniforms: model + lightViewProj + depth-storage params.
         tc_shadow_shadow_vs_params_t svp = {};
-        Mat4 modelT = getDefaultContext().getCurrentMatrix().transposed();
-        Mat4 lightVPT = shadowViewProj_.transposed();
+        Mat4 modelT = getDefaultContext().getMatrix().transposed();
+        // sh.viewProj stays in the GL clip convention because the
+        // sampling shader's ndc.z frustum check assumes [-1, 1] on every
+        // backend (the depth COMPARE never touches ndc.z). Only the matrix
+        // actually rasterizing the shadow pass must match the backend's clip
+        // range — without this remap, [0,1] backends clip away the near half
+        // of a directional light's ortho volume and those casters vanish.
+        Mat4 lightVPT = internal::toBackendClip(
+            sh.viewProj[sh.current]).transposed();
         std::memcpy(svp.model, modelT.m, sizeof(svp.model));
         std::memcpy(svp.lightViewProj, lightVPT.m, sizeof(svp.lightViewProj));
+        // depthParams: xyz = light direction, w = mode (0=persp, 1=ortho)
+        int cs = sh.current;
+        svp.depthParams[0] = sh.lightDirX[cs];
+        svp.depthParams[1] = sh.lightDirY[cs];
+        svp.depthParams[2] = sh.lightDirZ[cs];
+        svp.depthParams[3] = sh.mode[cs];
+        // depthParams2.x = refDot (ortho depth reference)
+        svp.depthParams2[0] = sh.refDot[cs];
+        svp.depthParams2[1] = 0.0f;
+        svp.depthParams2[2] = 0.0f;
+        svp.depthParams2[3] = 0.0f;
         sg_range r = { &svp, sizeof(svp) };
         sg_apply_uniforms(UB_tc_shadow_shadow_vs_params, &r);
 
@@ -501,13 +727,17 @@ public:
     }
 
     void endShadowPass() {
-        if (!inShadowPass_) return;
+        auto& sh = internal::currentWindowContext().shadow;
+        if (!sh.inPass) return;
         sg_end_pass();
-        inShadowPass_ = false;
+        sh.inPass = false;
         shadowDrawCount_ = 0;
 
-        // Resume swapchain pass
-        resumeSwapchainPass();
+        // Resume swapchain pass only if one was active before beginShadowPass()
+        if (sh.wasInSwapchainPass) {
+            resumeSwapchainPass();
+            sh.wasInSwapchainPass = false;
+        }
     }
 
 private:
@@ -515,6 +745,11 @@ private:
         if (shadowInitialized_) return;
 
         shadowShader_ = sg_make_shader(tc_shadow_shadow_depth_shader_desc(sg_query_backend()));
+        shadowReady_ = internal::internalShaderReady(shadowShader_, "shadow depth");
+        if (!shadowReady_) {
+            shadowInitialized_ = true;   // not retried
+            return;
+        }
 
         sg_pipeline_desc pd = {};
         pd.shader = shadowShader_;
@@ -532,42 +767,63 @@ private:
 
         pd.colors[0].pixel_format = SG_PIXELFORMAT_R32F;
         pd.index_type = SG_INDEXTYPE_UINT32;
+        // Shadow map is single-sampled; pin the pipeline to match. Leaving this
+        // at 0 makes sokol inherit the swapchain MSAA count (e.g. 4), which GL/
+        // Metal tolerate but WebGPU rejects ("attachment state not compatible"
+        // → shadow pass fails → black screen).
+        pd.sample_count = 1;
         pd.label = "tc_shadow_depth_pipeline";
 
         shadowPipeline_ = sg_make_pipeline(&pd);
         shadowInitialized_ = true;
     }
 
+    // The shadow map array is shared by all shadow slots at ONE resolution:
+    // the largest resolution requested by any shadow-enabled light so far.
+    // It is only recreated when it needs to GROW; lights requesting a smaller
+    // resolution render into (and sample from) the shared larger map.
     void ensureShadowTexture(int resolution) {
-        if (resolution == shadowTexResolution_) return;
+        if (resolution <= shadowTexResolution_) return;
 
-        // Destroy old resources
-        if (shadowColorImage_.id)   sg_destroy_image(shadowColorImage_);
-        if (shadowColorAttView_.id) sg_destroy_view(shadowColorAttView_);
-        if (shadowColorTexView_.id) sg_destroy_view(shadowColorTexView_);
-        if (shadowDepthImage_.id)   sg_destroy_image(shadowDepthImage_);
-        if (shadowDepthAttView_.id) sg_destroy_view(shadowDepthAttView_);
-        if (shadowSampler_.id)      sg_destroy_sampler(shadowSampler_);
+        // Release old resources (deferred: a deferred PBR draw recorded this
+        // frame may still bind the old shadow map view/sampler)
+        internal::deferGpuDestroy(shadowColorImage_);
+        for (int s = 0; s < internal::maxShadowLights; s++) {
+            internal::deferGpuDestroy(shadowColorAttView_[s]);
+        }
+        internal::deferGpuDestroy(shadowColorTexView_);
+        internal::deferGpuDestroy(shadowDepthImage_);
+        internal::deferGpuDestroy(shadowDepthAttView_);
+        internal::deferGpuDestroy(shadowSampler_);
 
-        // R32F color target (stores depth value for sampling)
+        // R32F color target array (stores depth value for sampling), one
+        // layer per shadow slot
         sg_image_desc cd = {};
+        cd.type = SG_IMAGETYPE_ARRAY;
+        cd.num_slices = internal::maxShadowLights;
         cd.usage.color_attachment = true;
         cd.width = resolution;
         cd.height = resolution;
         cd.pixel_format = SG_PIXELFORMAT_R32F;
         cd.sample_count = 1;
-        cd.label = "tc_shadow_color";
+        cd.label = "tc_shadow_color_array";
         shadowColorImage_ = sg_make_image(&cd);
 
-        sg_view_desc cav = {};
-        cav.color_attachment.image = shadowColorImage_;
-        shadowColorAttView_ = sg_make_view(&cav);
+        // Per-layer attachment views for rendering...
+        for (int s = 0; s < internal::maxShadowLights; s++) {
+            sg_view_desc cav = {};
+            cav.color_attachment.image = shadowColorImage_;
+            cav.color_attachment.slice = s;
+            shadowColorAttView_[s] = sg_make_view(&cav);
+        }
 
+        // ...and one full-array texture view for sampling
         sg_view_desc ctv = {};
         ctv.texture.image = shadowColorImage_;
         shadowColorTexView_ = sg_make_view(&ctv);
 
-        // Depth buffer (for correct depth testing during shadow pass)
+        // Depth buffer (for correct depth testing during shadow pass; a
+        // single 2D image reused by every slot's pass)
         sg_image_desc dd = {};
         dd.usage.depth_stencil_attachment = true;
         dd.width = resolution;
@@ -595,26 +851,38 @@ private:
 
     // --- PBR pipeline state ---
     sg_shader shader_{};
+    bool shaderReady_{false};
     std::map<int, sg_pipeline> pipelineCache_;  // keyed by sg_pixel_format
     bool initialized_{false};
 
     // --- Shadow pipeline state ---
     sg_shader shadowShader_{};
     sg_pipeline shadowPipeline_{};
+    bool shadowReady_{false};
     bool shadowInitialized_{false};
 
-    sg_image shadowColorImage_{};
-    sg_view shadowColorAttView_{};
-    sg_view shadowColorTexView_{};
-    sg_image shadowDepthImage_{};
+    sg_image shadowColorImage_{};   // SG_IMAGETYPE_ARRAY, maxShadowLights layers
+    sg_view shadowColorAttView_[internal::maxShadowLights]{};  // per-layer render views
+    sg_view shadowColorTexView_{};  // full-array sampling view
+    sg_image shadowDepthImage_{};   // shared 2D depth, reused per slot pass
     sg_view shadowDepthAttView_{};
     sg_sampler shadowSampler_{};
     int shadowTexResolution_{0};
 
-    bool inShadowPass_{false};
-    Mat4 shadowViewProj_{};
-    int shadowLightIndex_{-1};
+    // Transient within a single begin/end shadow pass (which completes inside
+    // one serialized window tick), so it can stay shared in the singleton.
     int shadowDrawCount_{0};
+
+    // NOTE: the per-frame shadow SLOT state (frame epoch, slot count, current
+    // slot, inPass / wasInSwapchainPass flags, and the per-slot VP / param
+    // arrays) is now PER-WINDOW: it lives in WindowContext::shadow
+    // (ShadowSlotState, tc/app/tcWindowContext.h). Only the GPU shadow-map
+    // array / views / sampler / pipeline above stay shared — they are reused
+    // serially across windows (see ShadowSlotState's comment).
+    bool shadowOverflowWarned_{false};
+    OnceGate projectorSlotWarned_;   // a projector light got no slot
+    OnceGate iesSlotWarned_;         // an IES light got no slot
+    bool shadowPointWarned_{false};
 
     // --- Fallback resources ---
     sg_image fallbackCube_{};
@@ -627,14 +895,46 @@ private:
     sg_view fallbackWhiteView_{};
     sg_image fallbackIes_{};       // alias of fallbackWhite_
     sg_view fallbackIesView_{};
+    sg_image fallbackShadowArray_{};
+    sg_view fallbackShadowArrayView_{};
     sg_sampler fallbackSampler_{};
     bool fallbackInitialized_{false};
 };
 
-// Singleton accessor. The instance lives in the first TU that calls this.
-inline PbrPipeline& getPbrPipeline() {
-    static PbrPipeline instance;
-    return instance;
+// Singleton accessor, defined in tcGlobal.cpp: one PBR pipeline (shaders,
+// fallback textures, shadow maps) per process. Header-inline, a hot reload
+// guest on Windows built its own copy, whose shadow passes and GPU objects the
+// host's flush never saw (#249).
+PbrPipeline& getPbrPipeline();
+
+// Flush the PBR draws deferred during an FBO pass, interleaved per-layer with the
+// FBO context's sokol_gl 2D content (mirror of flushDeferredShaderDraws but for a
+// single FBO context). Called by Fbo::end()/clearColor() while the FBO pass is
+// still active. Each sgl layer is drawn exactly once (O(N)).
+inline void flushFboDeferredPbr(sgl_context ctx) {
+    // FBO-pass deferral queues + layer counter are per-window (this window's tick).
+    auto& wctx = currentWindowContext();
+    for (int layer = 0; layer <= wctx.fboLayerNext; layer++) {
+        sgl_context_draw_layer(ctx, layer);
+        // Deferred shader draws share this FBO's layer space; replay them
+        // first within the layer, matching the swapchain flush order
+        // (sokol_gl -> shader -> PBR -> points) in flushDeferredShaderDraws.
+        for (auto& d : wctx.fboShaderDraws) {
+            if (d.layerId == layer) executeDeferredShaderDraw(d);
+        }
+        for (auto& d : wctx.fboPbrDraws) {
+            if (d.layerId == layer) getPbrPipeline().executePbrDraw(d.cmd);
+        }
+        // Point splats share this FBO's layer space (fboLayerNext); replay them
+        // in the same walk so they composite in submission order with PBR + 2D.
+        for (auto& d : wctx.fboPointDraws) {
+            if (d.layerId == layer) executePointDraw(d.cmd);
+        }
+    }
+    wctx.fboShaderDraws.clear();
+    wctx.fboPbrDraws.clear();
+    wctx.fboPointDraws.clear();
+    wctx.fboLayerNext = 0;
 }
 
 } // namespace internal

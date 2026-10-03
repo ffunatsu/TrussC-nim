@@ -3,53 +3,30 @@
 // =============================================================================
 
 #include "tc/network/tcTcpClient.h"
+#include "tc/network/tcSocketInternal.h"
 #include "tc/utils/tcLog.h"
 #include "tc/events/tcCoreEvents.h"
 #include <cstring>
 
 namespace trussc {
 
-std::atomic<int> TcpClient::instanceCount_{0};
-
-// =============================================================================
-// Winsock initialization (Windows only)
-// =============================================================================
-void TcpClient::initWinsock() {
-#ifdef _WIN32
-    static bool initialized = false;
-    if (!initialized) {
-        WSADATA wsaData;
-        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            logError() << "Winsock initialization failed";
-        }
-        initialized = true;
-    }
-#endif
-}
-
-void TcpClient::cleanupWinsock() {
-#ifdef _WIN32
-    WSACleanup();
-#endif
-}
-
 // =============================================================================
 // Constructor / Destructor
 // =============================================================================
 TcpClient::TcpClient() {
-    if (instanceCount_++ == 0) {
-        initWinsock();
-    }
+    internal::ensureWinsock();
 #ifdef __EMSCRIPTEN__
     useThread_ = false;
 #endif
 }
 
 TcpClient::~TcpClient() {
-    disconnect();
-    if (--instanceCount_ == 0) {
-        cleanupWinsock();
-    }
+    // A receive thread whose listener is destroying this client checks this
+    // once the notification returns, and stops without reading the client
+    *alive_ = false;
+    // Disconnect without onDisconnect: a listener that reconnects would
+    // reconnect a client that is going away.
+    disconnectImpl(false);
 }
 
 TcpClient::TcpClient(TcpClient&& other) noexcept
@@ -58,8 +35,11 @@ TcpClient::TcpClient(TcpClient&& other) noexcept
     , remotePort_(other.remotePort_)
     , running_(other.running_.load())
     , connected_(other.connected_.load())
-    , receiveBufferSize_(other.receiveBufferSize_)
+    , receiveBufferSize_(other.receiveBufferSize_.load())
 {
+    // recvBuf_ is not taken from `other`: it is scratch space that
+    // processNetwork() sizes on the next receive, and a receive thread of
+    // `other` may still be reading into it.
 #ifdef _WIN32
     other.socket_ = INVALID_SOCKET;
 #else
@@ -67,7 +47,6 @@ TcpClient::TcpClient(TcpClient&& other) noexcept
 #endif
     other.running_ = false;
     other.connected_ = false;
-    instanceCount_++;
 }
 
 TcpClient& TcpClient::operator=(TcpClient&& other) noexcept {
@@ -78,7 +57,8 @@ TcpClient& TcpClient::operator=(TcpClient&& other) noexcept {
         remotePort_ = other.remotePort_;
         running_ = other.running_.load();
         connected_ = other.connected_.load();
-        receiveBufferSize_ = other.receiveBufferSize_;
+        receiveBufferSize_ = other.receiveBufferSize_.load();
+        // recvBuf_ stays this object's own (see the move constructor).
 
 #ifdef _WIN32
         other.socket_ = INVALID_SOCKET;
@@ -95,9 +75,43 @@ TcpClient& TcpClient::operator=(TcpClient&& other) noexcept {
 // Connection management
 // =============================================================================
 bool TcpClient::connect(const std::string& host, int port) {
-    if (connected_ || connectPending_) {
+    if (connected_ || running_ || connectPending_) {
         disconnect();
     }
+
+    // Release what is left before starting over.
+    //  - After the peer closed the connection (or it failed) the flags above
+    //    are all clear, but the socket and the finished receive thread are
+    //    still here: overwriting socket_ leaks the descriptor, and assigning
+    //    a new thread to a still-joinable receiveThread_ calls std::terminate.
+    //  - The disconnect() above fired onDisconnect inline, and a listener may
+    //    have reconnected from it. This call came first and overrules that
+    //    connection: close it without another notification. running_ is
+    //    cleared before the shutdown(), so its receive thread's EOF loses the
+    //    exchange in processNetwork() and reports nothing (reported, it would
+    //    let the listener reconnect again from that thread while this one is
+    //    joining it).
+    running_ = false;
+    connectPending_ = false;
+    updateListener_.disconnect();
+    resetConnection();
+    if (connected_.exchange(false)) {
+        logWarning() << "TcpClient: connect() closes the connection an onDisconnect listener opened";
+    }
+    // A thread an earlier listener's connect() or disconnect() could not
+    // join (it ran on it) has been told to stop: wait for it here, before
+    // the new connection starts. The calling thread itself, if kept, stays.
+    keptThreads_.joinOthers();
+
+    // This connection's generation, taken before running_ or connected_ is
+    // set for it (and before onConnect). A receive thread that a listener's
+    // disconnect() let go of is joined above, unless this call runs on it:
+    // then it goes back to its loops once the listener returns. Those check
+    // the generation together with those flags, and have to see the new
+    // generation by the time they can see them set, or the thread reads the
+    // new socket next to the new receive thread (or, without threads, next
+    // to the update event).
+    const unsigned generation = ++receiveGeneration_;
 
     // Create socket
     socket_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -109,6 +123,9 @@ bool TcpClient::connect(const std::string& host, int port) {
         notifyError("Failed to create socket", SOCKET_ERROR_CODE);
         return false;
     }
+
+    // A send() racing the peer's close must fail, not raise SIGPIPE
+    internal::setNoSigpipe(socket_);
 
     // Set non-blocking if not using threads to avoid blocking connect
     if (!useThread_) {
@@ -124,13 +141,15 @@ bool TcpClient::connect(const std::string& host, int port) {
     std::string portStr = std::to_string(port);
     int ret = getaddrinfo(host.c_str(), portStr.c_str(), &hints, &result);
     if (ret != 0) {
-        notifyError("Failed to resolve host: " + host, ret);
+        // Clean up before notifying: an onError listener that reconnects
+        // must not have its new socket closed after it returns
         CLOSE_SOCKET(socket_);
 #ifdef _WIN32
         socket_ = INVALID_SOCKET;
 #else
         socket_ = -1;
 #endif
+        notifyError("Failed to resolve host: " + host, ret);
         return false;
     }
 
@@ -152,13 +171,14 @@ bool TcpClient::connect(const std::string& host, int port) {
             connectPending_ = true;
             running_ = true;
         } else {
-            notifyError("Failed to connect to " + host + ":" + std::to_string(port), err);
+            // Clean up before notifying (see above)
             CLOSE_SOCKET(socket_);
 #ifdef _WIN32
             socket_ = INVALID_SOCKET;
 #else
             socket_ = -1;
 #endif
+            notifyError("Failed to connect to " + host + ":" + std::to_string(port), err);
             return false;
         }
     } else {
@@ -178,7 +198,8 @@ bool TcpClient::connect(const std::string& host, int port) {
         if (useThread_) {
             // Start receive thread (ensure blocking mode for thread unless explicitly set otherwise)
             setBlocking(true);
-            receiveThread_ = std::thread(&TcpClient::receiveThreadFunc, this);
+            receiveThread_ = std::thread(&TcpClient::receiveThreadFunc, this, generation,
+                                         alive_);
         } else {
             // Register update listener
             updateListener_ = events().update.listen(this, &TcpClient::processNetwork);
@@ -203,7 +224,10 @@ void TcpClient::connectAsync(const std::string& host, int port) {
 
 void TcpClient::connectThreadFunc(const std::string& host, int port) {
     bool success = connect(host, port);
-    if (!success) {
+    // An onError listener may have started a newer attempt from inside the
+    // connect() above. That attempt reports its own result: this one is not
+    // reported once the client is connected or connecting again.
+    if (!success && !connected_ && !running_ && !connectPending_) {
         TcpConnectEventArgs args;
         args.success = false;
         args.message = "Connection failed";
@@ -212,10 +236,37 @@ void TcpClient::connectThreadFunc(const std::string& host, int port) {
 }
 
 void TcpClient::disconnect() {
+    disconnectImpl(true);
+}
+
+// disconnect() with notify, the destructor without
+void TcpClient::disconnectImpl(bool notify) {
     running_ = false;
     connectPending_ = false;
     updateListener_.disconnect();
 
+    resetConnection();
+
+    // On the connect thread itself (a listener there), keep it for a later
+    // join from another thread. Then join what earlier calls kept.
+    keptThreads_.release(connectThread_);
+    keptThreads_.joinOthers();
+
+    // The receive thread reports only a close it ran into itself (running_
+    // still set). The EOF that the shutdown() above wakes it with is this
+    // call's own, and is reported here, once, after the join.
+    if (connected_.exchange(false) && notify) {
+        TcpDisconnectEventArgs args;
+        args.reason = "Disconnected by client";
+        args.wasClean = true;
+        onDisconnect.notify(args);
+    }
+}
+
+// Close the socket and release the receive thread (join it, or keep it when
+// called on it). connectThread_ is left alone: connect() runs on it for
+// connectAsync(), and calls this.
+void TcpClient::resetConnection() {
 #ifdef _WIN32
     if (socket_ != INVALID_SOCKET) {
         shutdown(socket_, SD_BOTH);
@@ -230,31 +281,13 @@ void TcpClient::disconnect() {
     }
 #endif
 
-    if (receiveThread_.joinable()) {
-        if (receiveThread_.get_id() == std::this_thread::get_id()) {
-            // Called from within the receive thread (e.g. via callback)
-            // Cannot join self. Detach to allow thread to finish naturally.
-            receiveThread_.detach();
-        } else {
-            receiveThread_.join();
-        }
-    }
-
-    if (connectThread_.joinable()) {
-        if (connectThread_.get_id() == std::this_thread::get_id()) {
-            connectThread_.detach();
-        } else {
-            connectThread_.join();
-        }
-    }
-
-    if (connected_) {
-        connected_ = false;
-        TcpDisconnectEventArgs args;
-        args.reason = "Disconnected by client";
-        args.wasClean = true;
-        onDisconnect.notify(args);
-    }
+    // Called from within the receive thread (a listener that disconnects or
+    // reconnects), the thread cannot join itself: the client keeps it, and
+    // the next connect() or disconnect() on another thread, or the
+    // destructor, joins it. Its loops (processNetwork()'s receive loop, then
+    // receiveThreadFunc()'s) end on their own once running_ is cleared or a
+    // newer receive thread has taken over.
+    keptThreads_.release(receiveThread_);
 }
 
 bool TcpClient::isConnected() const {
@@ -276,7 +309,7 @@ bool TcpClient::send(const void* data, size_t size) {
     size_t remaining = size;
 
     while (remaining > 0) {
-        int sent = static_cast<int>(::send(socket_, ptr, remaining, 0));
+        int sent = static_cast<int>(::send(socket_, ptr, remaining, TC_SEND_FLAGS));
         if (sent == SOCKET_ERROR) {
             int err = SOCKET_ERROR_CODE;
             if (err == WOULD_BLOCK_ERROR) {
@@ -307,7 +340,17 @@ bool TcpClient::send(const std::string& message) {
 // Update / Receive logic
 // =============================================================================
 void TcpClient::processNetwork() {
-    if (!running_) return;
+    // Without threads (driven by the update event) the result is not needed:
+    // a stop means the connection ended and the update listener is gone.
+    // The token is copied first: a listener may destroy the client.
+    AliveToken alive = alive_;
+    processNetworkStep(alive);
+}
+
+// processNetwork()'s work. Returns false when the caller must stop without
+// reading the client again (see the header).
+bool TcpClient::processNetworkStep(const AliveToken& alive) {
+    if (!running_) return true;
 
     // Handle pending connection
     if (connectPending_) {
@@ -324,13 +367,20 @@ void TcpClient::processNetwork() {
                 int err = 0;
                 int len = sizeof(err);
                 getsockopt(socket_, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
-                notifyError("Connection failed", err);
+                // Tear down before notifying: a listener that reconnects must
+                // not have its new connection torn down after it returns
                 disconnect();
-                TcpConnectEventArgs args;
-                args.success = false;
-                args.message = "Connection failed";
-                onConnect.notify(args);
-                return;
+                notifyError("Connection failed", err);
+                // An onError listener may have destroyed the client
+                if (!*alive) return false;
+                // Not reported if an onError listener started a newer attempt
+                if (!connected_ && !running_ && !connectPending_) {
+                    TcpConnectEventArgs args;
+                    args.success = false;
+                    args.message = "Connection failed";
+                    onConnect.notify(args);
+                }
+                return false;
             }
             if (FD_ISSET(socket_, &writefds)) {
                 connectPending_ = false;
@@ -340,6 +390,8 @@ void TcpClient::processNetwork() {
                 args.success = true;
                 args.message = "Connected";
                 onConnect.notify(args);
+                // An onConnect listener may have destroyed the client
+                if (!*alive) return false;
             }
         }
 #else
@@ -359,69 +411,107 @@ void TcpClient::processNetwork() {
                 args.success = true;
                 args.message = "Connected";
                 onConnect.notify(args);
+                // An onConnect listener may have destroyed the client
+                if (!*alive) return false;
             } else {
-                notifyError("Connection failed", err);
+                // Tear down before notifying (see the Windows branch)
                 disconnect();
-                TcpConnectEventArgs args;
-                args.success = false;
-                args.message = "Connection failed";
-                onConnect.notify(args);
-                return;
+                notifyError("Connection failed", err);
+                // An onError listener may have destroyed the client
+                if (!*alive) return false;
+                // Not reported if an onError listener started a newer attempt
+                if (!connected_ && !running_ && !connectPending_) {
+                    TcpConnectEventArgs args;
+                    args.success = false;
+                    args.message = "Connection failed";
+                    onConnect.notify(args);
+                }
+                return false;
             }
         }
 #endif
     }
 
-    if (!connected_) return;
+    if (!connected_) return true;
 
-    // Receive data
-    static std::vector<char> buffer;
-    if (buffer.size() != receiveBufferSize_) {
-        buffer.resize(receiveBufferSize_);
+    // Receive data. The buffer is this client's own: every client's receive
+    // thread runs this at the same time.
+    if (recvBuf_.size() != receiveBufferSize_) {
+        recvBuf_.resize(receiveBufferSize_);
     }
 
-    while (connected_) {
-        int received = static_cast<int>(recv(socket_, buffer.data(), buffer.size(), 0));
+    // A listener on this thread that reconnects (an onReceive listener that
+    // calls connect(), say) sets connected_ again for the new connection,
+    // whose own receive thread reads it from then on. The generation stops
+    // this loop instead of letting it go back to recv() on the new socket
+    // next to that thread, sharing recvBuf_ with it.
+    const unsigned generation = receiveGeneration_;
+    while (connected_ && receiveGeneration_ == generation) {
+        int received = static_cast<int>(recv(socket_, recvBuf_.data(), recvBuf_.size(), 0));
 
         if (received > 0) {
             TcpReceiveEventArgs args;
-            args.data.assign(buffer.begin(), buffer.begin() + received);
+            args.data.assign(recvBuf_.begin(), recvBuf_.begin() + received);
             onReceive.notify(args);
-            
+            // An onReceive listener may have destroyed the client (an owner
+            // that replaces it from a close it handles inline, say)
+            if (!*alive) return false;
+
             // If using threads, we might block again. 
             // If not, we should return to let the app run.
             if (!useThread_) break; 
         } else if (received == 0) {
-            // Connection closed
-            running_ = false;
-            connected_ = false;
-            TcpDisconnectEventArgs args;
-            args.reason = "Connection closed by remote";
-            args.wasClean = true;
-            onDisconnect.notify(args);
+            // Connection closed. Report it only if this thread is the one
+            // ending the connection. A local disconnect() clears running_
+            // before its shutdown() wakes this recv() with EOF, and reports
+            // the disconnect itself once it has joined this thread; reporting
+            // it here as a remote close would let a reconnecting listener
+            // start over while disconnect() is still joining this thread.
+            if (running_.exchange(false)) {
+                connected_ = false;
+                TcpDisconnectEventArgs args;
+                args.reason = "Connection closed by remote";
+                args.wasClean = true;
+                // This thread stops here, decided before notifying: a
+                // listener may destroy, disconnect or reconnect the client,
+                // so nothing of it is read after the notification (#262).
+                onDisconnect.notify(args);
+                return false;
+            }
             break;
         } else {
             // Error
             int err = SOCKET_ERROR_CODE;
             if (err == WOULD_BLOCK_ERROR) break;
             
-            if (running_) {
-                running_ = false;
+            // As above: an error caused by a local disconnect() is its to report
+            if (running_.exchange(false)) {
                 connected_ = false;
                 TcpDisconnectEventArgs args;
                 args.reason = "Connection error";
                 args.wasClean = false;
+                // As above: stop without reading the client again
                 onDisconnect.notify(args);
+                return false;
             }
             break;
         }
     }
+    return true;
 }
 
-void TcpClient::receiveThreadFunc() {
-    while (running_) {
-        processNetwork();
-        if (running_) {
+void TcpClient::receiveThreadFunc(unsigned generation, AliveToken alive) {
+    // running_ alone cannot end this loop when a listener on this thread
+    // reconnects: connect() lets go of this thread (the client keeps it for
+    // a later join), starts the new connection's own, and running_ is true
+    // again for that one. The generation says which thread is current
+    // (processNetwork()'s receive loop checks it as well).
+    // processNetworkStep() returns false once it reported the end of the
+    // connection, or a listener destroyed the client: the thread then ends
+    // without reading the client again.
+    while (running_ && receiveGeneration_ == generation) {
+        if (!processNetworkStep(alive)) return;
+        if (running_ && receiveGeneration_ == generation) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }

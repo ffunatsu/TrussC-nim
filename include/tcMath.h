@@ -28,7 +28,7 @@ struct Vec2 {
     // Constructors
     Vec2() = default;
     Vec2(float x_, float y_) : x(x_), y(y_) {}
-    Vec2(float v) : x(v), y(v) {}
+    explicit Vec2(float v) : x(v), y(v) {}
     Vec2(const Vec2&) = default;
     Vec2& operator=(const Vec2&) = default;
 
@@ -145,7 +145,7 @@ struct Vec3 {
     // Constructors
     Vec3() = default;
     Vec3(float x_, float y_, float z_) : x(x_), y(y_), z(z_) {}
-    Vec3(float v) : x(v), y(v), z(v) {}
+    explicit Vec3(float v) : x(v), y(v), z(v) {}
     Vec3(const Vec2& v, float z_ = 0.0f) : x(v.x), y(v.y), z(z_) {}
     Vec3(const Vec3&) = default;
     Vec3& operator=(const Vec3&) = default;
@@ -247,7 +247,7 @@ struct IVec2 {
 
     IVec2() = default;
     IVec2(int x_, int y_) : x(x_), y(y_) {}
-    IVec2(int v) : x(v), y(v) {}
+    explicit IVec2(int v) : x(v), y(v) {}
 
     IVec2 operator+(const IVec2& v) const { return IVec2(x + v.x, y + v.y); }
     IVec2 operator-(const IVec2& v) const { return IVec2(x - v.x, y - v.y); }
@@ -277,7 +277,7 @@ struct IVec3 {
 
     IVec3() = default;
     IVec3(int x_, int y_, int z_) : x(x_), y(y_), z(z_) {}
-    IVec3(int v) : x(v), y(v), z(v) {}
+    explicit IVec3(int v) : x(v), y(v), z(v) {}
     IVec3(const IVec2& v, int z_ = 0) : x(v.x), y(v.y), z(z_) {}
 
     IVec3 operator+(const IVec3& v) const { return IVec3(x + v.x, y + v.y, z + v.z); }
@@ -311,7 +311,7 @@ struct Vec4 {
     // Constructors
     Vec4() = default;
     Vec4(float x_, float y_, float z_, float w_) : x(x_), y(y_), z(z_), w(w_) {}
-    Vec4(float v) : x(v), y(v), z(v), w(v) {}
+    explicit Vec4(float v) : x(v), y(v), z(v), w(v) {}
     Vec4(const Vec3& v, float w_ = 1.0f) : x(v.x), y(v.y), z(v.z), w(w_) {}
     Vec4(const Vec2& v, float z_ = 0.0f, float w_ = 1.0f) : x(v.x), y(v.y), z(z_), w(w_) {}
     Vec4(const Vec4&) = default;
@@ -328,6 +328,8 @@ struct Vec4 {
     // Arithmetic operators
     Vec4 operator+(const Vec4& v) const { return Vec4(x + v.x, y + v.y, z + v.z, w + v.w); }
     Vec4 operator-(const Vec4& v) const { return Vec4(x - v.x, y - v.y, z - v.z, w - v.w); }
+    Vec4 operator*(const Vec4& v) const { return Vec4(x * v.x, y * v.y, z * v.z, w * v.w); }
+    Vec4 operator/(const Vec4& v) const { return Vec4(x / v.x, y / v.y, z / v.z, w / v.w); }
     Vec4 operator*(float s) const { return Vec4(x * s, y * s, z * s, w * s); }
     Vec4 operator/(float s) const { return Vec4(x / s, y / s, z / s, w / s); }
     Vec4 operator-() const { return Vec4(-x, -y, -z, -w); }
@@ -335,6 +337,8 @@ struct Vec4 {
     // Compound assignment operators
     Vec4& operator+=(const Vec4& v) { x += v.x; y += v.y; z += v.z; w += v.w; return *this; }
     Vec4& operator-=(const Vec4& v) { x -= v.x; y -= v.y; z -= v.z; w -= v.w; return *this; }
+    Vec4& operator*=(const Vec4& v) { x *= v.x; y *= v.y; z *= v.z; w *= v.w; return *this; }
+    Vec4& operator/=(const Vec4& v) { x /= v.x; y /= v.y; z /= v.z; w /= v.w; return *this; }
     Vec4& operator*=(float s) { x *= s; y *= s; z *= s; w *= s; return *this; }
     Vec4& operator/=(float s) { x /= s; y /= s; z /= s; w /= s; return *this; }
 
@@ -410,7 +414,9 @@ struct Quaternion {
         return Quaternion(std::cos(halfAngle), a.x * s, a.y * s, a.z * s);
     }
 
-    // Create from Euler angles (pitch=X, yaw=Y, roll=Z, applied in ZYX order)
+    // Create from Euler angles (pitch=X, yaw=Y, roll=Z).
+    // Composition is Ry(yaw) * Rx(pitch) * Rz(roll) — the same Y-X-Z
+    // convention Unity uses. toEuler() below is its exact inverse.
     static Quaternion fromEuler(float pitch, float yaw, float roll) {
         float cp = std::cos(pitch * 0.5f);
         float sp = std::sin(pitch * 0.5f);
@@ -430,27 +436,32 @@ struct Quaternion {
         return fromEuler(euler.x, euler.y, euler.z);
     }
 
-    // Convert to Euler angles (pitch=X, yaw=Y, roll=Z)
+    // Convert to Euler angles (pitch=X, yaw=Y, roll=Z) — the exact inverse of
+    // fromEuler's Ry * Rx * Rz composition. (The previous extraction used a
+    // different convention's formulas, so fromEuler(toEuler(q)) drifted for
+    // compound rotations.) Derived from the rotation matrix of Ry*Rx*Rz:
+    //   M12 = -sin(p),  M02 = sin(y)cos(p),  M22 = cos(y)cos(p)
+    //   M10 = cos(p)sin(r),  M11 = cos(p)cos(r)
     Vec3 toEuler() const {
         Vec3 euler;
 
-        // Roll (Z)
-        float sinr_cosp = 2.0f * (w * z + x * y);
-        float cosr_cosp = 1.0f - 2.0f * (y * y + z * z);
-        euler.z = std::atan2(sinr_cosp, cosr_cosp);
-
         // Pitch (X)
         float sinp = 2.0f * (w * x - y * z);
-        if (std::abs(sinp) >= 1.0f) {
-            euler.x = std::copysign(QUARTER_TAU, sinp); // Gimbal lock
-        } else {
-            euler.x = std::asin(sinp);
+        if (std::abs(sinp) >= 0.9999f) {
+            // Gimbal lock: pitch = +-90deg, yaw and roll share one degree of
+            // freedom — put it all in yaw, set roll to 0.
+            euler.x = std::copysign(QUARTER_TAU, sinp);
+            euler.y = std::atan2(2.0f * (x * y - w * z), 1.0f - 2.0f * (y * y + z * z));
+            euler.z = 0.0f;
+            return euler;
         }
+        euler.x = std::asin(sinp);
 
-        // Yaw (Y)
-        float siny_cosp = 2.0f * (w * y + z * x);
-        float cosy_cosp = 1.0f - 2.0f * (x * x + y * y);
-        euler.y = std::atan2(siny_cosp, cosy_cosp);
+        // Yaw (Y): atan2(M02, M22)
+        euler.y = std::atan2(2.0f * (x * z + w * y), 1.0f - 2.0f * (x * x + y * y));
+
+        // Roll (Z): atan2(M10, M11)
+        euler.z = std::atan2(2.0f * (x * y + w * z), 1.0f - 2.0f * (x * x + z * z));
 
         return euler;
     }
@@ -864,47 +875,12 @@ struct Mat4 {
         );
     }
 
-    // Inverse (simple version for affine transformations)
+    // Inverse (simple version for affine transformations).
+    // Returns identity when |det| < 1e-10. Use tryInvert() when the caller
+    // must know whether an inverse exists.
     Mat4 inverted() const {
         Mat4 inv;
-
-        inv.m[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15]
-                 + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
-        inv.m[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15]
-                 - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
-        inv.m[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15]
-                 + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
-        inv.m[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11]
-                 - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
-
-        inv.m[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15]
-                 - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
-        inv.m[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15]
-                 + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
-        inv.m[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15]
-                 - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
-        inv.m[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11]
-                 + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
-
-        inv.m[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15]
-                 + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
-        inv.m[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15]
-                 - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
-        inv.m[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15]
-                  + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
-        inv.m[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11]
-                  - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
-
-        inv.m[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14]
-                  - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
-        inv.m[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14]
-                  + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
-        inv.m[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14]
-                  - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
-        inv.m[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10]
-                  + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
-
-        float det = m[0] * inv.m[0] + m[1] * inv.m[4] + m[2] * inv.m[8] + m[3] * inv.m[12];
+        float det = cofactors(inv.m);
         if (std::abs(det) < 1e-10f) return Mat4();
 
         float invDet = 1.0f / det;
@@ -912,6 +888,55 @@ struct Mat4 {
             inv.m[i] *= invDet;
         }
         return inv;
+    }
+
+    // Checked inverse: writes the inverse to `out` and returns true, or
+    // returns false (leaving `out` unchanged) when the matrix is degenerate,
+    // e.g. a transform with an axis scaled to 0.
+    //
+    // The test is relative to the matrix scale, not an absolute |det|:
+    // |det| is compared against the product of the column lengths
+    // (Hadamard's inequality: |det| <= product of column lengths, with
+    // equality for orthogonal columns). The ratio does not depend on how
+    // much each axis is scaled, so small but valid scales (e.g. 1e-6 on
+    // every axis) still invert; it only drops towards 0 when columns
+    // become parallel or vanish, i.e. when an axis has collapsed.
+    // For an affine matrix (last row 0,0,0,1) only the 3x3 linear part is
+    // measured, so a large translation does not lower the ratio.
+    // Tolerance 1e-6: float has ~7 significant digits (epsilon ~1.2e-7), so
+    // rounding in a collapsed matrix can leave a ratio of a few epsilon.
+    // Treat ratios below 1e-6 as numerically degenerate; orthogonal axes
+    // stay at ratio 1 regardless of their scale.
+    // Double intermediates keep the determinant and cofactors from
+    // underflowing/overflowing at valid float scales. inverted() retains
+    // its float arithmetic and absolute cutoff for compatibility.
+    bool tryInvert(Mat4& out) const {
+        const bool affine = m[12] == 0.0f && m[13] == 0.0f && m[14] == 0.0f && m[15] == 1.0f;
+        const int rows = affine ? 3 : 4;
+        const int cols = affine ? 3 : 4;
+        double colProduct = 1.0;
+        for (int c = 0; c < cols; c++) {
+            double len2 = 0.0;
+            for (int r = 0; r < rows; r++) {
+                double v = m[r * 4 + c];
+                len2 += v * v;
+            }
+            colProduct *= std::sqrt(len2);
+        }
+        if (!(colProduct > 0.0) || !std::isfinite(colProduct)) return false;
+
+        double adjugate[16];
+        double det = cofactors(adjugate);
+        if (!std::isfinite(det) || det == 0.0) return false;
+        if (std::abs(det) / colProduct < 1e-6) return false;
+
+        Mat4 inv;
+        for (int i = 0; i < 16; i++) {
+            inv.m[i] = static_cast<float>(adjugate[i] / det);
+            if (!std::isfinite(inv.m[i])) return false;
+        }
+        out = inv;
+        return true;
     }
 
     // View transformation (lookAt)
@@ -959,6 +984,54 @@ struct Mat4 {
             0, 0, -(farPlane + nearPlane) / d, -2.0f * farPlane * nearPlane / d,
             0, 0, -1, 0
         );
+    }
+
+private:
+    // Cofactor matrix (transposed, i.e. the adjugate) into `inv`; returns
+    // the determinant. Shared by inverted() and tryInvert().
+    template<typename Scalar>
+    Scalar cofactors(Scalar (&inv)[16]) const {
+        Scalar a[16];
+        for (int i = 0; i < 16; i++) a[i] = m[i];
+
+        inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15]
+                 + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+        inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15]
+                 - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+        inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15]
+                 + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+        inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11]
+                 - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+
+        inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15]
+                 - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+        inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15]
+                 + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+        inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15]
+                 - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+        inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11]
+                 + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+
+        inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15]
+                 + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+        inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15]
+                 - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+        inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15]
+                  + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+        inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11]
+                  - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+
+        inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14]
+                  - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+        inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14]
+                  + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+        inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14]
+                  - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+        inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10]
+                  + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+
+
+        return a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
     }
 };
 
@@ -1069,7 +1142,8 @@ inline float angleDifferenceDeg(float deg1, float deg2) {
 // =============================================================================
 
 namespace internal {
-    // Thread-local random number generator
+    // Thread-local random number generator. Per module on a Windows hot reload
+    // guest, which is harmless: app code seeds and draws from the same copy.
     inline std::mt19937& getRandomEngine() {
         static thread_local std::mt19937 engine(std::random_device{}());
         return engine;

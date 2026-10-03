@@ -3,6 +3,9 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
+#include "../events/tcEventArgs.h"
+#include "../math/tcRay.h"
+#include "../utils/tcReflect.h"
 
 namespace trussc {
 
@@ -36,7 +39,20 @@ public:
     Node* getOwner() { return owner_; }
     const Node* getOwner() const { return owner_; }
 
+    // -------------------------------------------------------------------------
+    // Reflection (TC_REFLECT)
+    // -------------------------------------------------------------------------
+    // Mod is its own reflection root (parallel to Node's). Subclasses expose
+    // values with TC_REFLECT(MyMod, Mod) { TC_VALUE(...) }; they then show up
+    // in inspectors and in the MCP node tree dump.
+    TC_REFLECT_ROOT(Mod) {}
+
 protected:
+    // Remove this mod from its owner (no need to name its own type). Safe to
+    // call from inside a mod's own update/draw/event handler — destruction is
+    // deferred until the current dispatch finishes. Defined in tcNode.h.
+    void removeSelf();
+
     // -------------------------------------------------------------------------
     // Lifecycle (override in derived classes)
     // -------------------------------------------------------------------------
@@ -57,6 +73,33 @@ protected:
 
     // Called when Mod is removed or Node is destroyed
     virtual void onDestroy() {}
+
+    // -------------------------------------------------------------------------
+    // Input events (forwarded from the owner Node)
+    // -------------------------------------------------------------------------
+    // Same args as Node's handlers. Mouse events reach mods on the hit node;
+    // key events broadcast to mods on every node. Return true from a mouse
+    // handler to consume the event (counts as the node consuming it).
+    virtual bool onMousePress(const MouseEventArgs& e)    { (void)e; return false; }
+    virtual bool onMouseRelease(const MouseEventArgs& e)  { (void)e; return false; }
+    virtual bool onMouseMove(const MouseMoveEventArgs& e) { (void)e; return false; }
+    virtual bool onMouseDrag(const MouseDragEventArgs& e) { (void)e; return false; }
+    virtual bool onMouseScroll(const ScrollEventArgs& e)  { (void)e; return false; }
+    virtual bool onKeyPress(const KeyEventArgs& e)        { (void)e; return false; }
+    virtual bool onKeyRelease(const KeyEventArgs& e)      { (void)e; return false; }
+    virtual void onMouseEnter() {}
+    virtual void onMouseLeave() {}
+
+    // -------------------------------------------------------------------------
+    // Hit test (mouse / pointer picking)
+    // -------------------------------------------------------------------------
+    // Screen-space picking only — NOT physics collision (physics colliders are
+    // a separate concept in the tcxPhysics addon). Override to define a hit
+    // shape in the node's LOCAL space. Checked together with Node::hitTest;
+    // if the node's own test OR any mod's returns true, the node is the hit.
+    virtual bool hitTest(const Ray& localRay, float& outDistance) {
+        (void)localRay; (void)outDistance; return false;
+    }
 
     // -------------------------------------------------------------------------
     // Exclusivity

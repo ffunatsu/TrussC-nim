@@ -4,36 +4,33 @@
 // To access variables in internal namespace
 
 #include <vector>
+#include "../utils/tcAnnotations.h"
 
 namespace trussc {
 
-// ---------------------------------------------------------------------------
-// Stroke vertex (position + color + width)
-// ---------------------------------------------------------------------------
-struct StrokeVertex {
-    Vec3 pos;
-    Color color;
-    float width;
-};
-
 // Internal state for shape/stroke drawing
 namespace internal {
-    // Shape (polygon) vertices
-    inline std::vector<Vec3> shapeVertices;
-    inline bool shapeStarted = false;
+
+    // Stroke vertex (position + color + width)
+    struct StrokeVertex {
+        Vec3 pos;
+        Color color;
+        float width;
+    };
 
     // Lines (independent line segments) vertices + colors
     struct LinesVertex {
         Vec3 pos;
         Color color;
     };
-    inline std::vector<LinesVertex> linesVertices;
-    inline bool linesStarted = false;
 
-    // Stroke vertices
-    inline std::vector<StrokeVertex> strokeVertices;
-    inline bool strokeStarted = false;
-    inline StrokeCap strokeStartCap = StrokeCap::Butt;  // Cap at first vertex
+    // The begin/end{Shape,Lines,Stroke} accumulators (shapeVertices/shapeStarted,
+    // linesVertices/linesStarted, strokeVertices/strokeStarted, strokeStartCap)
+    // are now PER-WINDOW: they live in WindowContext (tc/app/tcWindowContext.h)
+    // and are reached through currentWindowContext(). Moved out of process
+    // globals so a shape left open at end-of-tick can't bleed into the next
+    // window. StrokeVertex / LinesVertex above stay defined here (WindowContext
+    // holds their vectors by forward declaration).
 }
 
 // ===========================================================================
@@ -42,20 +39,22 @@ namespace internal {
 
 // Begin shape drawing
 inline void beginShape() {
-    internal::shapeVertices.clear();
-    internal::shapeStarted = true;
-    internal::strokeStarted = false;
+    auto& wctx = internal::currentWindowContext();
+    wctx.shapeVertices.clear();
+    wctx.shapeStarted = true;
+    wctx.strokeStarted = false;
 }
 
 // End shape drawing
 // close: if true, connects start and end points
 inline void endShape(bool close = false) {
-    if (!internal::shapeStarted || internal::shapeVertices.empty()) {
-        internal::shapeStarted = false;
+    auto& wctx = internal::currentWindowContext();
+    if (!wctx.shapeStarted || wctx.shapeVertices.empty()) {
+        wctx.shapeStarted = false;
         return;
     }
 
-    auto& verts = internal::shapeVertices;
+    auto& verts = wctx.shapeVertices;
     size_t n = verts.size();
     auto& ctx = getDefaultContext();
     Color col = ctx.getColor();
@@ -87,8 +86,8 @@ inline void endShape(bool close = false) {
         writer.end();
     }
 
-    internal::shapeVertices.clear();
-    internal::shapeStarted = false;
+    wctx.shapeVertices.clear();
+    wctx.shapeStarted = false;
 }
 
 // ===========================================================================
@@ -97,20 +96,22 @@ inline void endShape(bool close = false) {
 
 // Begin batch line drawing
 inline void beginLines() {
-    internal::linesVertices.clear();
-    internal::linesStarted = true;
-    internal::shapeStarted = false;
-    internal::strokeStarted = false;
+    auto& wctx = internal::currentWindowContext();
+    wctx.linesVertices.clear();
+    wctx.linesStarted = true;
+    wctx.shapeStarted = false;
+    wctx.strokeStarted = false;
 }
 
 // End batch line drawing — draws all accumulated vertex pairs as independent lines
 inline void endLines() {
-    if (!internal::linesStarted || internal::linesVertices.size() < 2) {
-        internal::linesStarted = false;
+    auto& wctx = internal::currentWindowContext();
+    if (!wctx.linesStarted || wctx.linesVertices.size() < 2) {
+        wctx.linesStarted = false;
         return;
     }
 
-    auto& verts = internal::linesVertices;
+    auto& verts = wctx.linesVertices;
     size_t n = verts.size();
     auto& writer = internal::getActiveWriter();
 
@@ -123,8 +124,8 @@ inline void endLines() {
     }
     writer.end();
 
-    internal::linesVertices.clear();
-    internal::linesStarted = false;
+    wctx.linesVertices.clear();
+    wctx.linesStarted = false;
 }
 
 // ===========================================================================
@@ -133,9 +134,10 @@ inline void endLines() {
 
 // Begin stroke drawing
 inline void beginStroke() {
-    internal::strokeVertices.clear();
-    internal::strokeStarted = true;
-    internal::shapeStarted = false;
+    auto& wctx = internal::currentWindowContext();
+    wctx.strokeVertices.clear();
+    wctx.strokeStarted = true;
+    wctx.shapeStarted = false;
 }
 
 // End stroke drawing - renders using StrokeMesh
@@ -148,18 +150,19 @@ inline void endStroke(bool close = false);  // Forward declaration (implemented 
 
 // Add vertex (3D)
 inline void vertex(float x, float y, float z) {
-    if (internal::linesStarted) {
+    auto& wctx = internal::currentWindowContext();
+    if (wctx.linesStarted) {
         auto& ctx = getDefaultContext();
-        internal::linesVertices.push_back({Vec3{x, y, z}, ctx.getColor()});
-    } else if (internal::shapeStarted) {
-        internal::shapeVertices.push_back(Vec3{x, y, z});
-    } else if (internal::strokeStarted) {
+        wctx.linesVertices.push_back({Vec3{x, y, z}, ctx.getColor()});
+    } else if (wctx.shapeStarted) {
+        wctx.shapeVertices.push_back(Vec3{x, y, z});
+    } else if (wctx.strokeStarted) {
         auto& ctx = getDefaultContext();
         // Save start cap on first vertex
-        if (internal::strokeVertices.empty()) {
-            internal::strokeStartCap = ctx.getStrokeCap();
+        if (wctx.strokeVertices.empty()) {
+            wctx.strokeStartCap = ctx.getStrokeCap();
         }
-        internal::strokeVertices.push_back({
+        wctx.strokeVertices.push_back({
             Vec3{x, y, z},
             ctx.getColor(),
             ctx.getStrokeWeight()
@@ -180,6 +183,146 @@ inline void vertex(const Vec2& v) {
 // Add vertex (Vec3)
 inline void vertex(const Vec3& v) {
     vertex(v.x, v.y, v.z);
+}
+
+// ===========================================================================
+// Curve appenders (shape buffer)
+//
+// Push a curved sequence of vertices into the active beginShape() /
+// beginStroke() / beginLines() buffer using the current CurveStyle. All
+// `append*` functions are pure conveniences — calling vertex() in a loop
+// gives the same result.
+// ===========================================================================
+
+// Append an arc spanning [angleBegin, angleEnd] radians around `(cx, cy)`.
+// Includes BOTH endpoints. If the previous shape vertex coincides with the
+// arc start, the duplicate is benign (degenerate triangle in the fan).
+inline void appendArc(float cx, float cy, float radius,
+                      float angleBegin, float angleEnd) {
+    if (radius <= 0.0f) return;
+    float span = angleEnd - angleBegin;
+    if (span == 0.0f) return;
+    auto& ctx = getDefaultContext();
+    int segs = ctx.decideArcSegments(radius, std::abs(span));
+    if (segs < 2) segs = 2;
+    for (int i = 0; i <= segs; i++) {
+        float a = angleBegin + span * ((float)i / (float)segs);
+        vertex(cx + std::cos(a) * radius, cy + std::sin(a) * radius);
+    }
+}
+
+inline void appendArc(const Vec2& center, float radius,
+                      float angleBegin, float angleEnd) {
+    appendArc(center.x, center.y, radius, angleBegin, angleEnd);
+}
+
+// Append the full closed outline of a superellipse (Lamé curve) inscribed in
+// the rect (x, y, w, h) — same bounding-box convention as drawSuperellipse.
+// Emits the start point twice (loop closure); the duplicate is benign.
+// Note: endShape() fills with a first-vertex fan, which is only correct for
+// convex outlines — fine for n >= 1; for concave n < 1 shapes use
+// drawSuperellipse (center fan) or fill via Path.
+inline void appendSuperellipse(float x, float y, float w, float h,
+                               float n = 5.0f) {
+    if (n <= 0.0f) return;
+    if (w < 0) { x += w; w = -w; }
+    if (h < 0) { y += h; h = -h; }
+    float rx = w * 0.5f, ry = h * 0.5f;
+    float cx = x + rx, cy = y + ry;
+    auto& ctx = getDefaultContext();
+    int segs = ctx.decideArcSegments(std::max(rx, ry), TAU);
+    if (segs < 8) segs = 8;
+    float expo = 2.0f / n;
+    for (int i = 0; i <= segs; i++) {
+        float a = TAU * ((float)i / (float)segs);
+        float c = std::cos(a), s = std::sin(a);
+        vertex(cx + std::copysign(std::pow(std::abs(c), expo), c) * rx,
+               cy + std::copysign(std::pow(std::abs(s), expo), s) * ry);
+    }
+}
+
+inline void appendSuperellipse(const Vec2& pos, const Vec2& size,
+                               float n = 5.0f) {
+    appendSuperellipse(pos.x, pos.y, size.x, size.y, n);
+}
+
+// Helper — tessellate one Catmull-Rom segment (with p0/p3 as tangent
+// influences, p1->p2 as the visible piece) into the active vertex buffer.
+namespace internal {
+inline void appendCatmullRomSegment_(const Vec3& p0, const Vec3& p1,
+                                     const Vec3& p2, const Vec3& p3) {
+    const auto& ctx = getDefaultContext();
+    Vec3 b1{p1.x + (p2.x - p0.x) / 6.0f,
+            p1.y + (p2.y - p0.y) / 6.0f,
+            p1.z + (p2.z - p0.z) / 6.0f};
+    Vec3 b2{p2.x - (p3.x - p1.x) / 6.0f,
+            p2.y - (p3.y - p1.y) / 6.0f,
+            p2.z - (p3.z - p1.z) / 6.0f};
+    if (ctx.getCurveMode() == CurveStyle::Mode::Tolerance) {
+        std::vector<Vec3> tmp;
+        tessellateCubicBezier(p1, b1, b2, p2,
+                              ctx.getCurveTolerance() / ctx.getScale(),
+                              tmp);
+        for (auto& q : tmp) vertex(q.x, q.y, q.z);
+    } else {
+        int n = std::max(2, ctx.getCurveResolution());
+        for (int j = 0; j <= n; j++) {
+            float t = (float)j / n;
+            float u = 1 - t;
+            float c0 = u*u*u, c1 = 3*u*u*t, c2 = 3*u*t*t, c3 = t*t*t;
+            vertex(c0*p1.x + c1*b1.x + c2*b2.x + c3*p2.x,
+                   c0*p1.y + c1*b1.y + c2*b2.y + c3*p2.y,
+                   c0*p1.z + c1*b1.z + c2*b2.z + c3*p2.z);
+        }
+    }
+}
+} // namespace internal
+
+// Hard cap on the number of points accepted by appendCurve. Catmull-Rom
+// chains expand each segment into a cubic Bezier and tessellate it
+// adaptively (up to ~131k recursive nodes at the depth cap, ~1-100ms per
+// segment depending on geometry). N segments → linear DoS surface; at
+// N=1e6 a single appendCurve call could spend hours of CPU.
+//
+// 100k is generous — a hand-drawn pen-tool path tops out in the low
+// thousands. If you really need more, your art tool is doing something
+// the framework wasn't designed for; split into multiple appendCurve
+// calls, or batch-tessellate yourself.
+inline constexpr int kAppendCurveMaxPoints = 100000;
+
+// Append a chained Catmull-Rom curve through `points`. Emits (N-3)
+// segments; needs N >= 4. Tangent points (first and last) are NOT
+// pushed as vertices — only the visible interior is appended.
+inline void appendCurve(const std::vector<Vec3>& points) {
+    if (points.size() < 4) return;
+    if ((int)points.size() > kAppendCurveMaxPoints) {
+        logWarning() << "appendCurve: refusing N=" << points.size()
+                     << " points (cap " << kAppendCurveMaxPoints << ").";
+        return;
+    }
+    for (size_t i = 0; i + 3 < points.size(); i++) {
+        internal::appendCatmullRomSegment_(points[i], points[i+1],
+                                           points[i+2], points[i+3]);
+    }
+}
+
+// Closed loop variant — wraparound tangents, all N points are passed
+// through.
+inline void appendCurve(const std::vector<Vec3>& points, bool closed) {
+    if (!closed) { appendCurve(points); return; }
+    const int n = (int)points.size();
+    if (n < 3) return;
+    if (n > kAppendCurveMaxPoints) {
+        logWarning() << "appendCurve (closed): refusing N=" << n
+                     << " points (cap " << kAppendCurveMaxPoints << ").";
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        internal::appendCatmullRomSegment_(points[(i - 1 + n) % n],
+                                           points[i],
+                                           points[(i + 1) % n],
+                                           points[(i + 2) % n]);
+    }
 }
 
 } // namespace trussc
