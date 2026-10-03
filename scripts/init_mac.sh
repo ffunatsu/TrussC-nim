@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-LIB_URL="https://github.com/ffunatsu/TrussC-nim/releases/download/TrussC-v0.5.0.1/osx_libs.zip"
+LIB_URL="https://github.com/ffunatsu/TrussC-nim/releases/download/TrussC-v0.7.5/osx_libs.zip"
 LIB_DEST=lib/osx
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
